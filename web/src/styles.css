@@ -1,6 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 
-:root { font-family: 'Manrope', system-ui, sans-serif; color: #101114; background: #f5f5f3; font-synthesis: none; }
+:root { font-family: 'Manrope', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif; color: #101114; background: #f5f5f3; font-synthesis: none; }
 * { box-sizing: border-box; } body { margin: 0; min-width: 320px; } button { font: inherit; cursor: pointer; touch-action: manipulation; }
 .app-shell { min-height: 100vh; display: flex; background: #f5f5f3; }
 .sidebar { width: 232px; background: #111214; color: #f7f7f4; padding: 22px 14px; display: flex; flex-direction: column; flex-shrink: 0; }

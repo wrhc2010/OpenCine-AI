@@ -1,41 +1,41 @@
 # AI Video Director
 
-An open-source, provider-agnostic **AI Video Director**. Give it a creative brief and it turns the brief into a versioned production plan, generates shots, evaluates every acceptance criterion with evidence, diagnoses failures, repairs prompts or generation strategy, retries within a budget, checks continuity, assembles audio/video, and pauses for a human when a decision is material.
+一个开源、模型无关的 **AI 视频导演** 编排系统。你只需要提供创意简报，它就会把需求整理成可版本化的制作计划，拆分场景与镜头，为每个镜头生成提示词和验收标准，调用视频模型，逐项检查结果，在失败后诊断原因并自动修复，最后完成连续性检查、音视频组装和交付。遇到重要决策时，系统会暂停并请求人工确认。
 
-The project is intentionally **Agent-first**: the timeline is an output, not the control surface. The domain state, event log, provenance and quality gates belong to this repository; model providers are adapters behind stable protocols.
+本项目从一开始就坚持 **Agent-first（智能体优先）**：时间线只是执行结果，不是主要控制面板。项目状态、事件日志、来源追踪和质量门禁由本仓库负责维护；具体模型通过稳定的 Provider 适配器接入，因此不会被某一家模型或平台锁定。
 
-## Current status
+## 当前状态
 
-This repository contains the Phase 0/1 foundation and a deterministic end-to-end reference loop:
+仓库目前包含 Phase 0/1 的工程基础，以及一条可重复运行的端到端参考闭环：
 
-- Creative IR for briefs, plans, scenes, shots, bibles, references and acceptance criteria
-- Clarification detection and approval gates
-- Provider protocols for LLM, VLM judge, video, reference, speech, music, SFX, lip-sync and assembly
-- Fal/Replicate-style asynchronous HTTP adapter and ComfyUI adapter
-- SQLite event-sourced development store with a Postgres-ready repository boundary
-- Retry, budget, lease, idempotency and checkpoint primitives
-- Monotonic project snapshot revisions with compare-and-swap conflict detection
-- Durable SQLite queue plus Redis Streams consumer-group adapter with worker leases and recovery
-- Fail-closed criterion-level judging, structured diagnosis and repair actions
-- Cross-shot continuity checks and deterministic mock providers
-- Optional FastAPI API and React/Vite operator console
-- Docker Compose services for API, worker, PostgreSQL, Redis and MinIO
+- 面向 Brief、Plan、Scene、Shot、Bible、Reference 和 Acceptance Criteria 的 Creative IR
+- 需求澄清检测与审批门禁
+- 覆盖 LLM、VLM Judge、视频、Reference、语音、音乐、音效、口型同步和组装的 Provider 协议
+- 兼容 Fal/Replicate 风格的异步 HTTP 适配器，以及 ComfyUI 适配器
+- 基于 SQLite 事件溯源的开发存储，并预留 PostgreSQL 存储边界
+- 重试、预算、租约、幂等和 checkpoint 基础能力
+- 单调递增的项目快照版本，以及 compare-and-swap 冲突检测
+- 持久化 SQLite 队列、Redis Streams consumer group 适配器、Worker 租约和故障恢复
+- Fail-closed（失败即阻断）的逐项验收、结构化诊断和修复动作
+- 跨镜头连续性检查与确定性的 Mock Provider
+- 可选 FastAPI API 和中文 React/Vite 操作控制台
+- 为 API、Worker、PostgreSQL、Redis 和 MinIO 提供的 Docker Compose 服务
 
-The mock provider is deliberately useful: it lets contributors run the entire Plan → Generate → Judge → Diagnose → Refine → Regenerate → Verify → Assemble loop without a paid model account.
+Mock Provider 的存在是有意为之：贡献者无需购买模型额度，就可以在本地跑通 `Plan → Generate → Judge → Diagnose → Refine → Regenerate → Verify → Assemble` 全流程。
 
-## Quick start
+## 快速开始
 
-### Core demo (Python only)
+### 核心演示（仅 Python）
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate       # PowerShell on Windows
+.venv\Scripts\activate       # PowerShell（Windows）
 pip install -e ".[dev]"
 python -m video_director.cli demo --shots 3
 pytest
 ```
 
-### API and web console
+### API 与 Web 控制台
 
 ```bash
 pip install -e ".[api]"
@@ -45,118 +45,91 @@ npm install
 npm run dev
 ```
 
-The API defaults to a local SQLite file (`.data/director.db`) and mock providers. Production deployments should set `DIRECTOR_DATABASE_URL`, `REDIS_URL`, `OBJECT_STORAGE_ENDPOINT`, and provider credentials.
+API 默认使用本地 SQLite 文件（`.data/director.db`）和 Mock Provider。部署到生产环境时，请配置 `DIRECTOR_DATABASE_URL`、`REDIS_URL`、`OBJECT_STORAGE_ENDPOINT` 以及各模型 Provider 的凭证。
 
-### Compose
+### Docker Compose
 
 ```bash
 docker compose up --build
 ```
 
-## Architecture
+## 架构
 
 ```text
-Creative Brief
+创意简报
       │
-Clarification Agent ── human gate ── Plan Agent ── human gate
-      │                                      │
-      └──────────── Creative IR / bibles / acceptance criteria
+澄清 Agent ── 人工门禁 ── 计划 Agent ── 人工门禁
+      │                                  │
+      └──────── Creative IR / Bible / 验收标准
+                                         │
+          调度器 ── Provider 适配器 ── 音视频 Artifact
+             │                            │
+             └── Judge（逐项证据）── 诊断 / 修复
                                              │
-             Scheduler ── Provider adapters ── Video/Audio artifacts
-                 │                              │
-                 └── Judge (criterion evidence) ── Diagnose/Repair
-                                                      │
-                                  continuity ── Assemble ── human delivery gate
+                              连续性检查 ── 组装 ── 人工交付门禁
 ```
 
-The public contracts live in `src/video_director/providers/base.py` and the domain objects live in `src/video_director/schemas.py`. They do not expose LangGraph, FastAPI, SQLAlchemy or a model vendor. Frameworks can be replaced without rewriting the production state machine.
+公共协议位于 `src/video_director/providers/base.py`，领域对象位于 `src/video_director/schemas.py`。这些接口不暴露 LangGraph、FastAPI、SQLAlchemy 或任何具体模型厂商的类型，因此替换框架或 Provider 时不需要重写生产状态机。
 
-## Design principles
+## 设计原则
 
-1. **Fail closed.** Missing evidence, malformed judge output, provider timeout or an unknown criterion is a failure that must be diagnosed or escalated.
-2. **Every decision is provenance.** Prompt, parameters, references, provider/model version, request id, cost, evidence and repair action are append-only records.
-3. **Bounded autonomy.** The Agent can choose a repair, but retry count, budget and human gates are hard policy.
-4. **Local context, global memory.** A shot receives the relevant scene/bible context; the project keeps compact artifacts and event snapshots rather than replaying an unbounded transcript.
-5. **Adapters over forks.** Only MIT/Apache-2.0 code is eligible for direct reuse. Research repositories without a clear license inform design but are not copied.
+1. **失败即阻断。** 缺少证据、Judge 返回格式错误、Provider 超时或出现未知验收项时，结果都不能被默认为通过，必须进入诊断或人工升级。
+2. **每个决策都可追溯。** Prompt、参数、Reference、Provider/模型版本、请求 ID、成本、证据和修复动作都会以追加记录保存。
+3. **有边界的自主性。** Agent 可以选择修复方式，但重试次数、预算和人工门禁是硬策略，不能被模型绕过。
+4. **局部上下文，项目级记忆。** 每个镜头只接收相关场景和 Bible 上下文；项目通过紧凑的 Artifact 索引和事件快照保存全局记忆，避免无限回放对话。
+5. **优先使用适配器，而不是直接 Fork。** 只有 MIT/Apache-2.0 代码才有资格直接复用；没有明确许可证的研究仓库只用于参考设计，不复制代码。
 
-## Research decision
+## 调研结论
 
-The implementation follows a **new Apache-2.0 core plus selective composition**. ViMax and showvi informed runtime/checkpoint patterns; open-video informed capability-aware engine contracts and stitching; PenShot and ARIS informed continuity, repair, fail-closed evaluation and human escalation. None of those projects owns the complete Judge → Diagnose → Refine loop required here, so a direct fork would create more migration debt than it removes. See [`docs/research.md`](docs/research.md) for the 16-capability matrix and license boundary. The implementation boundary is described in [`docs/architecture.md`](docs/architecture.md), and provider authors can start with [`docs/providers.md`](docs/providers.md).
+本实现采用 **新建 Apache-2.0 核心 + 局部组合复用** 的路线。ViMax 和 showvi 提供了运行时、checkpoint 等设计参考；open-video 提供了能力感知的引擎契约和拼接思路；PenShot 与 ARIS 提供了连续性、修复、失败即阻断评估和人工升级方面的启发。现有项目没有一个完整拥有本项目需要的 `Judge → Diagnose → Refine` 闭环，因此直接 Fork 单一项目带来的迁移和维护成本高于收益。
 
-## Roadmap
+详细的 16 项能力矩阵和许可证边界见 [`docs/research.md`](docs/research.md)；实现边界见 [`docs/architecture.md`](docs/architecture.md)；Provider 作者可从 [`docs/providers.md`](docs/providers.md) 开始。
 
-- Phase 0: contracts, persistence, compose and license/SBOM hygiene (implemented foundation)
-- Phase 1: LLM-backed clarification and 10-shot planning
-- Phase 2: cloud/ComfyUI workers, idempotent external jobs and cost accounting
-- Phase 3: VLM evidence sampling, repair policy and continuity embeddings
-- Phase 4: speech/music/SFX/subtitles, optional lip-sync and delivery UI
-- Phase 5: 40-shot chaos/load tests, provider SDK documentation and contributor program
+## 路线图
 
-## Asynchronous execution
+- Phase 0：契约、持久化、Compose 和许可证/SBOM 基础（已完成基础实现）
+- Phase 1：基于 LLM 的需求澄清与 10 镜头计划
+- Phase 2：云端/ComfyUI Worker、外部任务幂等和成本核算
+- Phase 3：VLM 证据采样、修复策略和基于 Embedding 的连续性检查
+- Phase 4：对白、音乐、音效、字幕、可选口型同步和交付界面
+- Phase 5：40 镜头混沌/负载测试、Provider SDK 文档和贡献者计划
 
-The API accepts `async: true` on a project run or Shot retry and returns a durable
-`job_id`. Run `python -m video_director.cli worker --once` for one local queue
-job, or use the Compose worker for Redis Streams. Query or cancel a job through
-`GET /v1/jobs/{job_id}` and `POST /v1/jobs/{job_id}/cancel`.
+## 异步执行
 
-## Controlled parallel execution
+项目运行或镜头重试接口传入 `async: true` 后，会返回一个持久化的 `job_id`。本地队列可以运行：
 
-Set DIRECTOR_PARALLELISM to a positive integer to run independent Shots in
-bounded dependency-ready waves. The default is 1, which is the deterministic
-single-threaded mode used by the CLI demo and most development work. A value
-greater than 1 is an experimental/controlled capability: each Shot runs from
-an isolated project snapshot, completed attempts and topology changes are
-merged incrementally, and the worker event trail is replayed into the main
-EventStore. Dependencies are never skipped; a Shot waits until every
-depends_on_shot_ids entry has passed. A repair that splits a Shot is added to a
-later wave instead of being silently omitted.
+```bash
+python -m video_director.cli worker --once
+```
 
-Parallel workers share the configured Provider objects in the current reference
-implementation. Use thread-safe clients or a Provider pool when enabling
-parallelism in production. Start 40-Shot load and recovery tests with Mock or
-Replay Providers so retries and callback recovery do not incur model charges.
+使用 Compose 启动时，Worker 会消费 Redis Streams。可以通过 `GET /v1/jobs/{job_id}` 查询任务，或通过 `POST /v1/jobs/{job_id}/cancel` 取消任务。
 
-## OpenAI-compatible LLM and VLM adapters
+## 受控并行执行
 
-The SDK-free OpenAICompatibleLLMProvider and
-OpenAICompatibleVLMJudgeProvider implement the provider protocols for servers
-that expose /v1/chat/completions. They accept an optional API key, model,
-temperature and token limit; structured calls use a strict JSON Schema response
-format. The VLM adapter sends the Shot criteria and artifact references as
-multimodal chat content and converts the response into criterion-level evidence.
+将 `DIRECTOR_PARALLELISM` 设置为正整数后，系统会在满足依赖的前提下，以有限并发分批执行相互独立的镜头。默认值为 `1`，这是 CLI 演示和大多数开发场景使用的确定性单线程模式。
 
-These adapters are library components rather than an implicit vendor lock-in.
-Construct them in a deployment-specific bootstrap and inject them into the
-DirectorOrchestrator; the default CLI/API bootstrap intentionally keeps the
-deterministic Mock Judge so a fresh checkout works without credentials. A
-custom bootstrap can read OPENAI_BASE_URL, OPENAI_API_KEY, DIRECTOR_LLM_MODEL
-and DIRECTOR_VLM_MODEL. Real model credentials, media URLs and provider policy
-still need an integration test before production use.
+大于 `1` 时属于受控实验能力：每个镜头从隔离的项目快照运行，完成的 Attempt 和拓扑变化会逐步合并，Worker 的事件轨迹也会回放到主 EventStore。系统不会跳过依赖，只有当 `depends_on_shot_ids` 中的所有镜头通过后，当前镜头才会开始。修复动作如果拆分镜头，新镜头会进入后续批次，不会被静默遗漏。
 
-## Known limitations
+当前参考实现中的并行 Worker 会共享已配置的 Provider 实例。生产部署启用并行时，请使用线程安全的客户端、按线程创建客户端，或配置 Provider pool。40 镜头的负载与恢复测试应优先使用 Mock 或 Replay Provider，避免重试和回调恢复产生真实模型费用。
 
-The repository is an extensible orchestration foundation and a deterministic
-reference implementation, not a production long-film generator yet. In
-particular:
+## OpenAI 兼容的 LLM 与 VLM 适配器
 
-- Fal/Replicate-compatible HTTP, ComfyUI, and OpenAI-compatible VLM adapters
-  have contract tests, but have not been exercised here with live credentials
-  and real media URLs.
-- Continuity currently uses Creative IR metadata and signatures. Embedding or
-  visual identity checks are extension points, not a claim of full visual
-  consistency.
-- Audio is provider-neutral/mock plumbing for dialogue, music, SFX, subtitles
-  and caching. Live TTS, music, SFX and professional mixing are not bundled.
-  Lip-sync remains optional and is never an assembly gate.
-- FFmpegAssembler has complete behavior for local file paths; remote object
-  storage requires a download/materialization layer in the deployment.
-- PostgreSQL, Redis Streams, MinIO and the Compose topology are wired as
-  adapters, but still need environment-specific end-to-end validation.
-- The current parallel scheduler is bounded and recoverable, but Provider
-  thread-safety and pooling are deployment responsibilities.
-- The default automatic retry limit is three attempts per Shot, with budget
-  soft warning/hard stop and human gates for material decisions.
+`OpenAICompatibleLLMProvider` 和 `OpenAICompatibleVLMJudgeProvider` 不依赖 SDK，可接入暴露 `/v1/chat/completions` 的服务。它们支持可选的 API Key、模型、温度和 token 上限；结构化调用使用严格的 JSON Schema 响应格式。VLM 适配器会把镜头验收标准和 Artifact 引用作为多模态消息发送，并将响应转换为逐项证据结果。
 
-## License
+这些适配器只是库组件，不会隐式绑定某一家厂商。请在部署侧的 bootstrap 中构造它们，再注入 `DirectorOrchestrator`。默认 CLI/API bootstrap 仍使用确定性的 Mock Judge，因此新 checkout 不需要凭证即可运行。自定义 bootstrap 可以读取 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`DIRECTOR_LLM_MODEL` 和 `DIRECTOR_VLM_MODEL`。真实模型凭证、媒体 URL 和 Provider 策略在用于生产前仍需要专门的集成测试。
 
-Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+## 已知限制
+
+本仓库是可扩展的编排基础和确定性参考实现，暂时还不是生产级长片生成器。当前限制包括：
+
+- Fal/Replicate 兼容 HTTP、ComfyUI 和 OpenAI 兼容 VLM 适配器已有契约测试，但尚未在本项目中使用真实凭证和真实媒体 URL 联调。
+- 连续性检查目前主要使用 Creative IR 元数据和签名。Embedding 或视觉身份检查是扩展点，不能据此宣称已经实现完整的视觉一致性。
+- 音频目前是 Provider-neutral/Mock 链路，覆盖对白、音乐、音效、字幕和缓存；没有内置真实 TTS、音乐生成、音效生成或专业混音。口型同步仍是可选能力，也不会成为组装门禁。
+- `FFmpegAssembler` 对本地文件路径具备完整行为；远程对象存储仍需要下载或 materialization 层。
+- PostgreSQL、Redis Streams、MinIO 和 Compose 拓扑已经接入适配器，但仍需要结合具体部署环境完成端到端验证。
+- 当前并行调度器具备边界控制和恢复能力，但 Provider 的线程安全与连接池由部署方负责。
+- 默认每个镜头最多自动尝试 3 次；触发预算软警告或硬停止后，会进入人工门禁。
+
+## 许可证
+
+Apache License 2.0。详见 [`LICENSE`](LICENSE) 和 [`NOTICE`](NOTICE)。
