@@ -112,6 +112,29 @@ python -m video_director.cli worker --once
 
 当前参考实现中的并行 Worker 会共享已配置的 Provider 实例。生产部署启用并行时，请使用线程安全的客户端、按线程创建客户端，或配置 Provider pool。40 镜头的负载与恢复测试应优先使用 Mock 或 Replay Provider，避免重试和回调恢复产生真实模型费用。
 
+## 通过本机 frpc 外网访问
+
+Web 控制台只监听本机 `127.0.0.1:3000`，可以使用 `frpc` 将这个端口映射到公网。建议只转发 Web 端口，不要把 API 的 `8000` 端口单独暴露；Web 的 `/v1` 和 `/healthz` 请求会通过 Vite 代理回本机 API。
+
+在 frpc 配置中加入一个 TCP 代理（公网端口按你的服务端分配）：
+
+```toml
+[[proxies]]
+name = "ai-video-director-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3000
+remotePort = 17707
+```
+
+如果通过公网域名访问，需要把域名加入 `web/.env.local`：
+
+```dotenv
+DIRECTOR_ALLOWED_HOSTS=video.example.com
+```
+
+`web/.env.local` 已被 Git 忽略，不要把 frpc 的 token 或其他凭证提交到仓库。通用配置模板见 [`web/.env.example`](web/.env.example)。
+
 ## OpenAI 兼容的 LLM 与 VLM 适配器
 
 `OpenAICompatibleLLMProvider` 和 `OpenAICompatibleVLMJudgeProvider` 不依赖 SDK，可接入暴露 `/v1/chat/completions` 的服务。它们支持可选的 API Key、模型、温度和 token 上限；结构化调用使用严格的 JSON Schema 响应格式。VLM 适配器会把镜头验收标准和 Artifact 引用作为多模态消息发送，并将响应转换为逐项证据结果。
