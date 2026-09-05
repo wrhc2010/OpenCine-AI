@@ -6,13 +6,17 @@ the API stack, while installing `.[api]` exposes a ready-to-run app.
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
+import secrets
 import time
+from datetime import UTC, datetime, timedelta
 from collections.abc import Mapping
 from typing import Any
 
 try:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request, Response
     from fastapi.responses import JSONResponse, StreamingResponse
 except ImportError as error:  # pragma: no cover - exercised when API extras are absent
     raise RuntimeError("FastAPI is optional; install ai-video-director[api] to run the API") from error
@@ -21,7 +25,7 @@ from .cli import build_mock_orchestrator, build_orchestrator
 from .execution import BudgetExceeded, HumanGate
 from .queue import make_job_queue
 from .scheduler import ProjectJobHandler, queue_project_run
-from .schemas import CreativeBrief, Project, as_jsonable, stable_hash
+from .schemas import CreativeBrief, Project, ProjectStatus, as_jsonable, stable_hash
 from .store import SnapshotConflict
 
 
@@ -49,6 +53,195 @@ projects: dict[str, Project] = {}
 
 def project_view(project: Project) -> dict[str, Any]:
     return as_jsonable(project)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _auth_enabled() -> bool:
+    stored = orchestrator.store.get_setting("DIRECTOR_AUTH_ENABLED")
+    return _bool_env("DIRECTOR_AUTH_ENABLED", True) if stored is None else _as_bool(stored)
+
+
+SETTING_DEFAULTS: dict[str, Any] = {
+    "DIRECTOR_AUTH_ENABLED": True,
+    "DIRECTOR_HOST_CHECK_ENABLED": False,
+    "DIRECTOR_CORS_ENABLED": False,
+    "DIRECTOR_RATE_LIMIT_ENABLED": False,
+    "DIRECTOR_CONTENT_SAFETY_ENABLED": False,
+    "DIRECTOR_PROVIDER_SAFETY_ENABLED": False,
+    "DIRECTOR_MAX_ATTEMPTS": 3,
+    "DIRECTOR_PARALLELISM": 1,
+    "DIRECTOR_PROJECT_BUDGET_USD": 75.0,
+    "VIDEO_PROVIDER": "mock",
+    "VIDEO_MODEL": "video-model",
+    "DIRECTOR_LLM_MODEL": "gpt-4o-mini",
+    "DIRECTOR_VLM_MODEL": "",
+}
+SETTING_KEYS = set(SETTING_DEFAULTS) | {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
+SECRET_SETTING_KEYS = {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
+CONNECTION_SETTING_KEYS = {"DIRECTOR_DATABASE_URL", "REDIS_URL", "OBJECT_STORAGE_ENDPOINT"}
+SETTING_KEYS |= CONNECTION_SETTING_KEYS
+RESTART_SETTING_KEYS = {
+    "DIRECTOR_DATABASE_URL",
+    "REDIS_URL",
+    "OBJECT_STORAGE_ENDPOINT",
+    "OPENAI_API_KEY",
+    "FAL_API_KEY",
+    "REPLICATE_API_TOKEN",
+}
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+    return "scrypt$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+
+def _password_matches(password: str, encoded: str) -> bool:
+    try:
+        _, salt_raw, digest_raw = encoded.split("$", 2)
+        salt = base64.urlsafe_b64decode(salt_raw.encode())
+        expected = base64.urlsafe_b64decode(digest_raw.encode())
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def _validate_credentials(username: Any, password: Any) -> tuple[str, str]:
+    if not isinstance(username, str) or not username.strip():
+        raise HTTPException(400, "用户名不能为空")
+    if not isinstance(password, str) or len(password) < 8:
+        raise HTTPException(400, "密码至少需要 8 个字符")
+    return username.strip(), password
+
+
+@app.get("/v1/auth/status")
+def auth_status() -> dict[str, Any]:
+    user = orchestrator.store.auth_user()
+    return {"enabled": _auth_enabled(), "initialized": user is not None, "username": user[0] if user else None}
+
+
+@app.post("/v1/auth/setup")
+def auth_setup(payload: dict[str, Any]) -> dict[str, Any]:
+    if not _auth_enabled():
+        return {"enabled": False, "initialized": True}
+    if orchestrator.store.auth_user() is not None:
+        raise HTTPException(409, "管理员账号已经初始化")
+    username, password = _validate_credentials(payload.get("username"), payload.get("password"))
+    orchestrator.store.create_auth_user(username, _password_hash(password))
+    return {"enabled": True, "initialized": True, "username": username}
+
+
+@app.post("/v1/auth/login")
+def auth_login(payload: dict[str, Any], response: Response) -> dict[str, Any]:
+    if not _auth_enabled():
+        return {"enabled": False, "authenticated": True}
+    username, password = _validate_credentials(payload.get("username"), payload.get("password"))
+    user = orchestrator.store.auth_user()
+    if user is None:
+        raise HTTPException(409, "请先完成首次管理员初始化")
+    if user[0] != username or not _password_matches(password, user[1]):
+        raise HTTPException(401, "用户名或密码不正确")
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(UTC) + timedelta(days=14)
+    orchestrator.store.create_auth_session(token, username, expires.isoformat())
+    response.set_cookie("director_session", token, httponly=True, samesite="lax", max_age=14 * 24 * 3600, path="/")
+    return {"enabled": True, "authenticated": True, "username": username}
+
+
+@app.post("/v1/auth/logout")
+def auth_logout(request: Request, response: Response) -> dict[str, bool]:
+    token = request.cookies.get("director_session")
+    if token:
+        orchestrator.store.revoke_auth_session(token)
+    response.delete_cookie("director_session", path="/")
+    return {"ok": True}
+
+
+@app.get("/v1/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    if not _auth_enabled():
+        return {"enabled": False, "authenticated": True, "username": None}
+    token = request.cookies.get("director_session")
+    username = orchestrator.store.auth_session_username(token) if token else None
+    if not username:
+        raise HTTPException(401, "未登录")
+    return {"enabled": True, "authenticated": True, "username": username}
+
+
+@app.get("/v1/settings")
+def get_settings() -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, default in SETTING_DEFAULTS.items():
+        value = orchestrator.store.get_setting(key)
+        if value is None:
+            value = os.getenv(key, str(default))
+        if isinstance(default, bool):
+            result[key] = _as_bool(value)
+        elif isinstance(default, int) and not isinstance(default, bool):
+            try:
+                result[key] = int(value)
+            except (TypeError, ValueError):
+                result[key] = default
+        elif isinstance(default, float):
+            try:
+                result[key] = float(value)
+            except (TypeError, ValueError):
+                result[key] = default
+        else:
+            result[key] = str(value)
+    for key in SECRET_SETTING_KEYS:
+        value = orchestrator.store.get_setting(key) or os.getenv(key, "")
+        result[key] = "已配置" if value else ""
+    for key in ("DIRECTOR_DATABASE_URL", "REDIS_URL", "OBJECT_STORAGE_ENDPOINT"):
+        result[key] = "已配置" if orchestrator.store.get_setting(key) or os.getenv(key) else ""
+    return {
+        "settings": result,
+        "requires_restart": sorted(RESTART_SETTING_KEYS),
+        "llm_configured": bool(orchestrator.store.get_setting("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")),
+        "vlm_configured": bool(orchestrator.store.get_setting("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")),
+    }
+
+
+@app.patch("/v1/settings")
+def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "设置必须是 JSON 对象")
+    for key, value in payload.items():
+        if key not in SETTING_KEYS:
+            raise HTTPException(400, f"不支持的设置项：{key}")
+        if isinstance(value, (dict, list)):
+            raise HTTPException(400, f"设置项必须是简单值：{key}")
+        if key in SECRET_SETTING_KEYS and str(value).strip() in {"已配置", "********", "••••••••"}:
+            continue
+        if isinstance(SETTING_DEFAULTS.get(key), bool):
+            if isinstance(value, str) and value.strip().lower() not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                raise HTTPException(400, f"设置项必须是布尔值：{key}")
+            value = "true" if _as_bool(value) else "false"
+        elif key in {"DIRECTOR_MAX_ATTEMPTS", "DIRECTOR_PARALLELISM"}:
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as error:
+                raise HTTPException(400, f"设置项必须是正整数：{key}") from error
+            if value < 1:
+                raise HTTPException(400, f"设置项必须是正整数：{key}")
+        elif key == "DIRECTOR_PROJECT_BUDGET_USD":
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as error:
+                raise HTTPException(400, "项目预算必须是非负数字") from error
+            if value < 0:
+                raise HTTPException(400, "项目预算必须是非负数字")
+        elif not isinstance(value, (str, int, float, bool)):
+            raise HTTPException(400, f"设置项必须是简单值：{key}")
+        orchestrator.store.set_setting(key, str(value))
+    return get_settings()
 
 
 @app.get("/healthz")
@@ -89,6 +282,34 @@ def create_project(payload: dict[str, Any]) -> dict[str, Any]:
     return project_view(project)
 
 
+@app.get("/v1/projects/{project_id}/settings")
+def get_project_settings(project_id: str) -> dict[str, Any]:
+    project = _get(project_id)
+    return {"project_id": project.id, "settings": as_jsonable(project.brief), "resolved": project.active_plan.resolved_settings if project.active_plan else {}}
+
+
+@app.patch("/v1/projects/{project_id}/settings")
+def update_project_settings(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    project = _get(project_id)
+    allowed = set(CreativeBrief.__dataclass_fields__)
+    merged = {**as_jsonable(project.brief), **{key: value for key, value in payload.items() if key in allowed}}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise HTTPException(400, f"不支持的项目设置：{', '.join(unknown)}")
+    try:
+        brief = CreativeBrief(**merged)
+    except TypeError as error:
+        raise HTTPException(400, str(error)) from error
+    errors = brief.validate()
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+    project.brief = brief
+    if project.status not in {ProjectStatus.CLARIFYING, ProjectStatus.CANCELLED, ProjectStatus.DELIVERED}:
+        project.transition(ProjectStatus.AWAITING_PLAN_APPROVAL, force=True)
+    orchestrator.store.save_project(project, event_type="project.settings.updated", payload={"keys": sorted(payload)})
+    return get_project_settings(project_id)
+
+
 @app.get("/v1/projects/{project_id}")
 def get_project(project_id: str) -> dict[str, Any]:
     project = orchestrator.store.load_project(project_id) or projects.get(project_id)
@@ -99,11 +320,13 @@ def get_project(project_id: str) -> dict[str, Any]:
 
 
 @app.post("/v1/projects/{project_id}/clarifications")
-def answer_clarifications(project_id: str, payload: dict[str, str]) -> dict[str, Any]:
+def answer_clarifications(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     project = _get(project_id)
     try:
         return project_view(orchestrator.answer_clarifications(project, payload))
-    except (HumanGate, ValueError) as error:
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+    except HumanGate as error:
         raise HTTPException(409, str(error)) from error
 
 

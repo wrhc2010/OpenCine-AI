@@ -75,6 +75,15 @@ class Verdict(str, Enum):
     FAIL = "FAIL"
 
 
+class AcceptanceMode(str, Enum):
+    AUTO = "auto"
+    LOW = "low"
+    STANDARD = "standard"
+    STRICT = "strict"
+    CUSTOM = "custom"
+    NONE = "none"
+
+
 class RepairKind(str, Enum):
     PROMPT = "prompt"
     PARAMETERS = "parameters"
@@ -116,6 +125,13 @@ class CreativeBrief:
     shot_duration_seconds: float = 15.0
     max_shots: int = 10
     budget_usd: float = 75.0
+    parallelism_mode: str = "auto"
+    parallelism: int | None = None
+    resolution_mode: str = "auto"
+    resolution_width: int | None = None
+    resolution_height: int | None = None
+    acceptance_mode: str = AcceptanceMode.STANDARD.value
+    acceptance_custom: str | None = None
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -137,6 +153,27 @@ class CreativeBrief:
             errors.append("audio_required must be a boolean")
         if not isinstance(self.aspect_ratio, str) or not re.fullmatch(r"[1-9]\d*:[1-9]\d*", self.aspect_ratio.strip()):
             errors.append("aspect_ratio must use the form WIDTH:HEIGHT")
+        if self.parallelism_mode not in {"auto", "preset", "custom"}:
+            errors.append("parallelism_mode must be auto, preset or custom")
+        if self.parallelism is not None and (isinstance(self.parallelism, bool) or not isinstance(self.parallelism, int) or self.parallelism < 1):
+            errors.append("parallelism must be a positive integer when provided")
+        if self.parallelism_mode == "preset" and self.parallelism not in {1, 2, 4, 8}:
+            errors.append("preset parallelism must be one of 1, 2, 4 or 8")
+        if self.parallelism_mode == "custom" and self.parallelism is None:
+            errors.append("custom parallelism requires a value")
+        if self.resolution_mode not in {"auto", "preset", "custom"}:
+            errors.append("resolution_mode must be auto, preset or custom")
+        for name, value in (("resolution_width", self.resolution_width), ("resolution_height", self.resolution_height)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                errors.append(f"{name} must be a positive integer when provided")
+        if self.resolution_mode == "custom" and (self.resolution_width is None or self.resolution_height is None):
+            errors.append("custom resolution requires width and height")
+        if self.resolution_mode == "preset" and (self.resolution_width, self.resolution_height) not in {(1280, 720), (1920, 1080), (3840, 2160)}:
+            errors.append("preset resolution must be 1280x720, 1920x1080 or 3840x2160")
+        if self.acceptance_mode not in {item.value for item in AcceptanceMode}:
+            errors.append("acceptance_mode is invalid")
+        if self.acceptance_mode == AcceptanceMode.CUSTOM.value and not (self.acceptance_custom or "").strip():
+            errors.append("custom acceptance mode requires acceptance_custom")
         # A plan cannot satisfy a requested duration when the configured shot
         # ceiling is too small. Fail at the brief boundary instead of silently
         # producing a shorter film.
@@ -166,7 +203,17 @@ class ClarificationTurn:
     source: str = "agent"
     confidence: float = 0.0
     confirmed: bool = False
+    options: list["ClarificationOption"] = field(default_factory=list)
+    skipped: bool = False
     id: str = field(default_factory=lambda: new_id("clar"))
+
+
+@dataclass(slots=True)
+class ClarificationOption:
+    label: str
+    value: str
+    explanation: str
+    id: str = field(default_factory=lambda: new_id("option"))
 
 
 @dataclass(slots=True)
@@ -305,6 +352,7 @@ class PlanVersion:
     audio_cues: list[AudioCue] = field(default_factory=list)
     status: str = "draft"
     approved_by: str | None = None
+    resolved_settings: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: new_id("plan"))
 
     def validate(self) -> list[str]:
@@ -570,6 +618,7 @@ class CriterionResult:
     reason: str | None = None
     confidence: float = 0.0
     repair_suggestions: list[RepairKind] = field(default_factory=list)
+    skipped: bool = False
 
     def fail_closed(self) -> CriterionResult:
         evidence_items = self.evidence if isinstance(self.evidence, (list, tuple)) else []
@@ -596,6 +645,8 @@ class CriterionResult:
                     continue
             valid_evidence.append(item)
         if not valid_evidence:
+            if self.skipped:
+                return replace(self, evidence=[])
             return CriterionResult(
                 criterion_id=self.criterion_id,
                 verdict=Verdict.FAIL,
@@ -634,6 +685,7 @@ class CriterionResult:
                 reason=self.reason or "Judge did not provide valid evidence",
                 confidence=self.confidence,
                 repair_suggestions=self.repair_suggestions or [RepairKind.HUMAN],
+                skipped=self.skipped,
             )
         if valid_evidence is not self.evidence:
             return CriterionResult(

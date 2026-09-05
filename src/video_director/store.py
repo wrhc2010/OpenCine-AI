@@ -27,6 +27,7 @@ from .schemas import (
     AudioCue,
     CharacterBible,
     ClarificationTurn,
+    ClarificationOption,
     CostRecord,
     CreativeBrief,
     CriterionCategory,
@@ -111,6 +112,17 @@ class EventStore:
             CREATE TABLE IF NOT EXISTS idempotency_keys (
                 project_id TEXT NOT NULL, key TEXT NOT NULL, result TEXT,
                 created_at TEXT NOT NULL, PRIMARY KEY(project_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS auth_users (
+                id INTEGER PRIMARY KEY CHECK (id = 1), username TEXT NOT NULL,
+                password_hash TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -261,6 +273,51 @@ class EventStore:
     def close(self) -> None:
         self.connection.close()
 
+    def get_setting(self, key: str) -> str | None:
+        row = self.connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, value, _now()),
+            )
+
+    def auth_user(self) -> tuple[str, str] | None:
+        row = self.connection.execute("SELECT username,password_hash FROM auth_users WHERE id=1").fetchone()
+        return (str(row[0]), str(row[1])) if row else None
+
+    def create_auth_user(self, username: str, password_hash: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO auth_users(id,username,password_hash,created_at) VALUES(1,?,?,?)",
+                (username, password_hash, _now()),
+            )
+
+    def create_auth_session(self, token: str, username: str, expires_at: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO auth_sessions(token,username,expires_at,created_at) VALUES(?,?,?,?)",
+                (token, username, expires_at, _now()),
+            )
+
+    def auth_session_username(self, token: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT username,expires_at FROM auth_sessions WHERE token=?", (token,)
+        ).fetchone()
+        if not row:
+            return None
+        if row[1] <= _now():
+            self.revoke_auth_session(token)
+            return None
+        return str(row[0])
+
+    def revoke_auth_session(self, token: str) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM auth_sessions WHERE token=?", (token,))
+
 
 SQLiteEventStore = EventStore
 
@@ -291,6 +348,17 @@ class PostgresEventStore:
                 CREATE TABLE IF NOT EXISTS idempotency_keys (
                     project_id TEXT NOT NULL, key TEXT NOT NULL, result JSONB,
                     created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(project_id,key)
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auth_users (
+                    id INTEGER PRIMARY KEY, username TEXT NOT NULL,
+                    password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
                 );
                 """
             )
@@ -411,6 +479,62 @@ class PostgresEventStore:
 
     def close(self) -> None:
         self.connection.close()
+
+    def get_setting(self, key: str) -> str | None:
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = cursor.fetchone()
+        return str(row[0]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, value, datetime.now(UTC)),
+            )
+        self.connection.commit()
+
+    def auth_user(self) -> tuple[str, str] | None:
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT username,password_hash FROM auth_users WHERE id=1")
+            row = cursor.fetchone()
+        return (str(row[0]), str(row[1])) if row else None
+
+    def create_auth_user(self, username: str, password_hash: str) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO auth_users(id,username,password_hash,created_at) VALUES(1,%s,%s,%s)",
+                (username, password_hash, datetime.now(UTC)),
+            )
+        self.connection.commit()
+
+    def create_auth_session(self, token: str, username: str, expires_at: str) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO auth_sessions(token,username,expires_at,created_at) VALUES(%s,%s,%s,%s)",
+                (token, username, expires_at, datetime.now(UTC)),
+            )
+        self.connection.commit()
+
+    def auth_session_username(self, token: str) -> str | None:
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT username,expires_at FROM auth_sessions WHERE token=%s", (token,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        expiry = row[1]
+        if isinstance(expiry, str):
+            expiry = _dt(expiry)
+        if expiry <= datetime.now(UTC):
+            self.revoke_auth_session(token)
+            return None
+        return str(row[0])
+
+    def revoke_auth_session(self, token: str) -> None:
+        with self.connection.cursor() as cursor:
+            cursor.execute("DELETE FROM auth_sessions WHERE token=%s", (token,))
+        self.connection.commit()
 
 
 def make_event_store(url: str | Path | None = None) -> EventStore | PostgresEventStore:
@@ -649,6 +773,7 @@ def _judge(raw: Any) -> JudgeResult | None:
                     reason=_optional_string(result.get("reason")),
                     confidence=_finite_float(result.get("confidence"), 0.0),
                     repair_suggestions=repairs,
+                    skipped=_boolean(result.get("skipped")),
                 ).fail_closed()
             )
     elif raw_results is not None:
@@ -821,6 +946,7 @@ def _legacy_decode_project(raw: Mapping[str, Any]) -> Project:
                 audio_cues=cues,
                 status=str(plan_raw.get("status", "draft")),
                 approved_by=plan_raw.get("approved_by"),
+                resolved_settings=dict(plan_raw.get("resolved_settings") or {}),
                 id=str(plan_raw.get("id") or PlanVersion.__dataclass_fields__["id"].default_factory()),
             )
         )
@@ -856,6 +982,13 @@ def _sanitize_brief(raw: Any) -> dict[str, Any]:
         "shot_duration_seconds": _finite_float(value.get("shot_duration_seconds"), 15.0, minimum=0.000001),
         "max_shots": _integer(value.get("max_shots"), 10, minimum=1),
         "budget_usd": _finite_float(value.get("budget_usd"), 75.0, minimum=0.0),
+        "parallelism_mode": _string(value.get("parallelism_mode"), "auto"),
+        "parallelism": _integer(value.get("parallelism"), 0, minimum=1) if value.get("parallelism") is not None else None,
+        "resolution_mode": _string(value.get("resolution_mode"), "auto"),
+        "resolution_width": _integer(value.get("resolution_width"), 0, minimum=1) if value.get("resolution_width") is not None else None,
+        "resolution_height": _integer(value.get("resolution_height"), 0, minimum=1) if value.get("resolution_height") is not None else None,
+        "acceptance_mode": _string(value.get("acceptance_mode"), "standard"),
+        "acceptance_custom": _optional_string(value.get("acceptance_custom")),
     }
 
 
@@ -870,6 +1003,16 @@ def _sanitize_clarification(raw: Any) -> dict[str, Any] | None:
         "source": _string(value.get("source"), "agent"),
         "confidence": _finite_float(value.get("confidence"), 0.0),
         "confirmed": _boolean(value.get("confirmed")),
+        "skipped": _boolean(value.get("skipped")),
+        "options": [
+            {
+                "label": _string(_mapping(option).get("label")),
+                "value": _string(_mapping(option).get("value")),
+                "explanation": _string(_mapping(option).get("explanation")),
+                **({"id": _string(_mapping(option).get("id"))} if _string(_mapping(option).get("id")) else {}),
+            }
+            for option in _items(value.get("options")) if isinstance(option, Mapping)
+        ],
     }
     if _string(value.get("id")):
         result["id"] = _string(value.get("id"))
@@ -969,6 +1112,7 @@ def _sanitize_plan(raw: Any, version: int, brief: Mapping[str, Any]) -> dict[str
         "audio_cues": [item for item in cues if item is not None],
         "status": _string(value.get("status"), "draft"),
         "approved_by": _optional_string(value.get("approved_by")),
+        "resolved_settings": _mapping_dict(value.get("resolved_settings")),
     }
     if _string(value.get("id")):
         result["id"] = _string(value.get("id"))

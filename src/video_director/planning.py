@@ -12,6 +12,7 @@ from .schemas import (
     AudioCue,
     CharacterBible,
     ClarificationTurn,
+    ClarificationOption,
     CreativeBrief,
     CriterionCategory,
     LocationBible,
@@ -54,22 +55,53 @@ class ClarificationAgent:
                 "audio": ("dialogue", "voice", "narration", "music", "sound", "对白", "旁白", "音乐", "音效"),
             }[key]
             if not any(marker in text for marker in markers):
-                turns.append(ClarificationTurn(question=question, required=True))
+                turns.append(ClarificationTurn(question=question, required=True, options=self._options(key, chinese=questions is self.QUESTIONS_ZH)))
         return turns
+
+    @staticmethod
+    def _options(key: str, *, chinese: bool) -> list[ClarificationOption]:
+        values = {
+            "characters": [
+                ("沿用一位主角", "聚焦单一人物，跨镜头一致性最好。"),
+                ("两位核心人物", "增加关系张力，但需要更严格控制人物身份。"),
+                ("群像叙事", "画面更丰富，生成成本和一致性风险也更高。"),
+            ],
+            "setting": [
+                ("现代城市", "便于使用常见场景素材，节奏更利落。"),
+                ("自然环境", "氛围感更强，但天气和空间连续性要求更高。"),
+                ("架空世界", "想象空间最大，需要更完整的世界观设定。"),
+            ],
+            "arc": [
+                ("完成一次明确任务", "故事目标清晰，适合短片快速收束。"),
+                ("人物完成内心转变", "情绪更细腻，需要更稳定的表演和节奏。"),
+                ("留下开放式结尾", "余味更长，但结局不会完全解释。"),
+            ],
+            "audio": [
+                ("中文旁白 + 字幕", "信息传达最稳定，适合中文观众。"),
+                ("对白驱动 + 字幕", "人物互动更强，需要更严格的口型和时序控制。"),
+                ("纯音乐与音效", "减少语言限制，把重点放在画面和氛围上。"),
+            ],
+        }
+        if not chinese:
+            return [ClarificationOption(label, label, explanation) for label, explanation in values[key]]
+        return [ClarificationOption(label, label, explanation) for label, explanation in values[key]]
 
     def apply_answers(self, turns: list[ClarificationTurn], answers: dict[str, str]) -> list[ClarificationTurn]:
         if not isinstance(answers, dict):
             raise TypeError("clarification answers must be an object")
-        invalid = [key for key, value in answers.items() if not isinstance(key, str) or not isinstance(value, str)]
+        invalid = [key for key, value in answers.items() if not isinstance(key, str) or not isinstance(value, (str, dict))]
         if invalid:
-            raise TypeError("clarification answers must map strings to strings")
+            raise TypeError("clarification answers must map ids to strings or {answer, skip} objects")
         updated: list[ClarificationTurn] = []
         for turn in turns:
             answer = answers.get(turn.id) or answers.get(turn.question)
             if answer is None:
                 updated.append(turn)
+            elif isinstance(answer, dict) and answer.get("skip"):
+                updated.append(replace(turn, answer=None, confirmed=True, skipped=True, confidence=1.0))
             else:
-                updated.append(replace(turn, answer=answer, confirmed=bool(answer.strip()), confidence=1.0))
+                text = answer if isinstance(answer, str) else str(answer.get("answer", ""))
+                updated.append(replace(turn, answer=text, confirmed=bool(text.strip()), skipped=False, confidence=1.0))
         return updated
 
     def unresolved(self, turns: Iterable[ClarificationTurn]) -> list[ClarificationTurn]:
@@ -85,6 +117,7 @@ class PlanAgent:
         *,
         version: int = 1,
         clarifications: Iterable[ClarificationTurn] = (),
+        default_parallelism: int = 1,
     ) -> PlanVersion:
         errors = brief.validate()
         if errors:
@@ -192,11 +225,41 @@ class PlanAgent:
             scene.shot_ids.append(shot.id)
             shots.append(shot)
         cues = self._audio_cues(brief, source, shot_count)
-        plan = PlanVersion(version, brief, scenes, shots, [character], [location], style, [reference], cues)
+        resolved = self.resolve_settings(brief, default_parallelism=default_parallelism)
+        for shot in shots:
+            if shot.prompt_bundle:
+                shot.prompt_bundle.parameters.update(resolved)
+        plan = PlanVersion(version, brief, scenes, shots, [character], [location], style, [reference], cues, resolved_settings=resolved)
         validation = plan.validate()
         if validation:
             raise ValueError("Generated invalid plan: " + "; ".join(validation))
         return plan
+
+    @staticmethod
+    def resolve_settings(brief: CreativeBrief, *, default_parallelism: int = 1) -> dict[str, object]:
+        if brief.parallelism_mode in {"preset", "custom"} and brief.parallelism:
+            parallelism = brief.parallelism
+        elif brief.parallelism_mode == "auto":
+            parallelism = max(1, int(default_parallelism))
+        else:
+            parallelism = max(1, int(default_parallelism))
+        if brief.resolution_mode == "custom" and brief.resolution_width and brief.resolution_height:
+            width, height = brief.resolution_width, brief.resolution_height
+        elif brief.resolution_mode == "preset":
+            width, height = (1280, 720) if brief.resolution_width == 1280 else (3840, 2160) if brief.resolution_width == 3840 else (1920, 1080)
+        else:
+            width, height = (1920, 1080)
+        acceptance = brief.acceptance_mode
+        if acceptance == "auto":
+            acceptance = "standard"
+        return {
+            "parallelism": parallelism,
+            "resolution_width": width,
+            "resolution_height": height,
+            "acceptance_mode": acceptance,
+            "shot_duration_seconds": brief.shot_duration_seconds,
+            "duration_seconds": brief.duration_seconds,
+        }
 
     @staticmethod
     def _audio_cues(brief: CreativeBrief, source: str, shot_count: int) -> list[AudioCue]:

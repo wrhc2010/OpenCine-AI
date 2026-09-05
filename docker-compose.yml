@@ -9,12 +9,26 @@ services:
       OBJECT_STORAGE_ENDPOINT: http://minio:9000
       OBJECT_STORAGE_BUCKET: video-director
       DIRECTOR_PARALLELISM: ${DIRECTOR_PARALLELISM:-1}
+      DIRECTOR_AUTH_ENABLED: ${DIRECTOR_AUTH_ENABLED:-true}
+      DIRECTOR_HOST_CHECK_ENABLED: ${DIRECTOR_HOST_CHECK_ENABLED:-false}
+      DIRECTOR_CORS_ENABLED: ${DIRECTOR_CORS_ENABLED:-false}
+      DIRECTOR_RATE_LIMIT_ENABLED: ${DIRECTOR_RATE_LIMIT_ENABLED:-false}
+      DIRECTOR_CONTENT_SAFETY_ENABLED: ${DIRECTOR_CONTENT_SAFETY_ENABLED:-false}
+      DIRECTOR_PROVIDER_SAFETY_ENABLED: ${DIRECTOR_PROVIDER_SAFETY_ENABLED:-false}
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
   worker:
     build:
       context: .
@@ -26,9 +40,14 @@ services:
       OBJECT_STORAGE_ENDPOINT: http://minio:9000
       OBJECT_STORAGE_BUCKET: video-director
       DIRECTOR_PARALLELISM: ${DIRECTOR_PARALLELISM:-1}
+      DIRECTOR_AUTH_ENABLED: ${DIRECTOR_AUTH_ENABLED:-true}
     depends_on:
-      - postgres
-      - redis
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
   postgres:
     image: postgres:16-alpine
     environment:
@@ -37,8 +56,18 @@ services:
       POSTGRES_PASSWORD: director
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U director -d director"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
   redis:
     image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -46,10 +75,31 @@ services:
       MINIO_ROOT_USER: director
       MINIO_ROOT_PASSWORD: director-secret
     ports:
-      - "9000:9000"
       - "9001:9001"
     volumes:
       - minio-data:/data
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command: >-
+      "until mc alias set local http://minio:9000 director director-secret; do sleep 2; done;
+      mc mb --ignore-existing local/video-director"
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 volumes:
   postgres-data:
   minio-data:

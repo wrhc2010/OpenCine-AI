@@ -28,6 +28,30 @@ class QualityController:
         self.min_confidence = min(max(min_confidence, 0.0), 1.0)
 
     def evaluate(self, shot: Shot, artifacts: Sequence[ArtifactRef], context: Mapping[str, object] | None = None) -> JudgeResult:
+        context = context or {}
+        acceptance_mode = str(context.get("acceptance_mode", "standard")).lower()
+        if acceptance_mode == "none":
+            artifact = next((item for item in artifacts if getattr(item, "uri", "")), None)
+            criteria: list[CriterionResult] = []
+            for criterion in shot.acceptance_criteria:
+                evidence = [] if artifact is None else [Evidence("metadata", artifact.uri, metadata={"mode": "none", "criterion_id": criterion.id})]
+                technical = criterion.category.value in {"technical", "safety"}
+                if technical and artifact is None:
+                    criteria.append(CriterionResult(criterion.id, Verdict.FAIL, [], "missing_artifact", "未找到可验证的媒体产物", 0.0, [RepairKind.HUMAN]))
+                else:
+                    criteria.append(
+                        CriterionResult(
+                            criterion.id,
+                            Verdict.PASS,
+                            evidence,
+                            reason="已关闭语义验收；该项由技术门禁或策略记录覆盖" if technical else "语义验收已跳过",
+                            confidence=1.0,
+                            skipped=not technical,
+                        )
+                    )
+            verdict = Verdict.FAIL if any(item.verdict == Verdict.FAIL for item in criteria) else Verdict.PASS
+            return JudgeResult(shot.id, verdict, criteria, "disabled", "none", summary="semantic acceptance disabled")
+        min_confidence = {"low": 0.2, "standard": self.min_confidence, "strict": 0.8, "custom": self.min_confidence}.get(acceptance_mode, self.min_confidence)
         provider_name = getattr(self.judge, "name", self.judge.__class__.__name__)
         try:
             result = self.judge.judge(JudgeInput(shot, artifacts, context or {}))
@@ -58,7 +82,7 @@ class QualityController:
             planned = expected_criteria.get(criterion.criterion_id)
             if planned is not None:
                 criterion = self._validate_evidence(criterion, planned, shot.duration_seconds)
-            if criterion.verdict == Verdict.PASS and criterion.confidence < self.min_confidence:
+            if criterion.verdict == Verdict.PASS and criterion.confidence < min_confidence:
                 criterion = CriterionResult(criterion.criterion_id, Verdict.FAIL, criterion.evidence, "low_confidence", "Judge confidence is below the configured acceptance threshold", criterion.confidence, criterion.repair_suggestions or [RepairKind.HUMAN])
             normalized.append(criterion)
         observed = {criterion.criterion_id for criterion in normalized}
@@ -193,7 +217,7 @@ class QualityController:
             confidence = float(confidence_raw)
         except (TypeError, ValueError):
             confidence = float("nan")
-        return CriterionResult(str(raw.get("criterion_id", "")), raw.get("verdict", Verdict.FAIL), evidence, raw.get("failure_code"), raw.get("reason"), confidence, suggestions)
+        return CriterionResult(str(raw.get("criterion_id", "")), raw.get("verdict", Verdict.FAIL), evidence, raw.get("failure_code"), raw.get("reason"), confidence, suggestions, bool(raw.get("skipped", False)))
 
     @staticmethod
     def _normalize_verdict(criterion: CriterionResult) -> CriterionResult:

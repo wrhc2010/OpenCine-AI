@@ -91,6 +91,24 @@ class DirectorOrchestrator:
         self.continuity = ContinuityGuardian()
         self.max_attempts = max_attempts
 
+    def _effective_parallelism(self, project: Project) -> int:
+        plan = project.active_plan
+        if plan and isinstance(plan.resolved_settings.get("parallelism"), int):
+            return max(1, int(plan.resolved_settings["parallelism"]))
+        if project.brief.parallelism_mode == "custom" and project.brief.parallelism:
+            return max(1, project.brief.parallelism)
+        return self.parallelism
+
+    def _global_parallelism(self) -> int:
+        raw = self.store.get_setting("DIRECTOR_PARALLELISM")
+        if raw is None:
+            return self.parallelism
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return self.parallelism
+        return value if value >= 1 else self.parallelism
+
     def create_project(self, brief: CreativeBrief) -> Project:
         errors = brief.validate()
         if errors:
@@ -113,7 +131,14 @@ class DirectorOrchestrator:
         if unresolved:
             raise HumanGate("Required clarification is unresolved")
         version = len(project.plans) + 1
-        project.plans.append(self.planner.create_plan(project.brief, version=version, clarifications=project.clarification_turns))
+        project.plans.append(
+            self.planner.create_plan(
+                project.brief,
+                version=version,
+                clarifications=project.clarification_turns,
+                default_parallelism=self._global_parallelism(),
+            )
+        )
         project.transition(ProjectStatus.AWAITING_PLAN_APPROVAL)
         self.store.save_project(project, event_type="plan.created", payload={"plan_id": project.active_plan.id})
         return project
@@ -215,7 +240,7 @@ class DirectorOrchestrator:
             raise HumanGate(f"Project is not ready to run: {project.status.value}")
         project.transition(ProjectStatus.GENERATING)
         self.store.save_project(project, event_type="generation.started", payload={"resume": bool(project.attempts)})
-        if self.parallelism > 1:
+        if self._effective_parallelism(project) > 1:
             return self._run_parallel(project)
         artifacts_by_shot: dict[str, list[ArtifactRef]] = {}
         shot_index = 0
@@ -281,10 +306,11 @@ class DirectorOrchestrator:
                 project.transition(ProjectStatus.AWAITING_HUMAN)
                 self.store.save_project(project, event_type="scheduler.blocked", payload={"reason": reason, "pending_shot_ids": sorted(pending_ids)})
                 raise HumanGate(reason)
-            wave = ready[: self.parallelism]
+            parallelism = self._effective_parallelism(project)
+            wave = ready[: parallelism]
             baseline = copy.deepcopy(project)
             baseline_cost = project.total_cost_usd
-            self.store.append_event(project.id, "scheduler.wave.started", {"shot_ids": [shot.id for shot in wave], "parallelism": self.parallelism})
+            self.store.append_event(project.id, "scheduler.wave.started", {"shot_ids": [shot.id for shot in wave], "parallelism": parallelism})
             results: list[tuple[Shot, Project, list[ArtifactRef], list[Any], BaseException | None]] = []
             with ThreadPoolExecutor(max_workers=len(wave), thread_name_prefix="director-shot") as executor:
                 futures = {executor.submit(self._run_parallel_shot, baseline, shot.id): shot for shot in wave}
@@ -987,7 +1013,7 @@ class DirectorOrchestrator:
             self._record_cost(project, attempt.cost)
             self.store.save_project(project, event_type="shot.generated", payload={"shot_id": shot.id, "attempt": number, "cost_usd": attempt.cost.amount_usd})
             project.transition(ProjectStatus.JUDGING)
-            judge = self.quality.evaluate(shot, artifacts)
+            judge = self.quality.evaluate(shot, artifacts, {"acceptance_mode": project.brief.acceptance_mode, "acceptance_custom": project.brief.acceptance_custom})
             attempt.judge_result = judge
             attempt.status = "passed" if judge.passed else "judged_failed"
             self.store.save_project(project, event_type="shot.judged", payload={"shot_id": shot.id, "attempt": number, "verdict": judge.verdict.value, "failed_criteria": [item.criterion_id for item in judge.failed_criteria]})
@@ -1123,7 +1149,7 @@ class DirectorOrchestrator:
             self.store.save_project(project, event_type="shot.cost.reconciled", payload={"shot_id": shot.id, "attempt": attempt.number, "cost_usd": attempt.cost.amount_usd})
         if attempt.judge_result is None:
             project.transition(ProjectStatus.JUDGING)
-            judge = self.quality.evaluate(shot, artifacts)
+            judge = self.quality.evaluate(shot, artifacts, {"acceptance_mode": project.brief.acceptance_mode, "acceptance_custom": project.brief.acceptance_custom})
             attempt.judge_result = judge
             attempt.status = "passed" if judge.passed else "judged_failed"
             self.store.save_project(project, event_type="shot.judged.resumed", payload={"shot_id": shot.id, "attempt": attempt.number, "verdict": judge.verdict.value, "failed_criteria": [item.criterion_id for item in judge.failed_criteria]})
