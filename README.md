@@ -1,6 +1,26 @@
 # OpenCine-AI
 
+<p align="center">
+  <img src="web/public/opencine-ai-logo.png" alt="OpenCine-AI" width="92" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/wrhc2010/OpenCine-AI/releases"><img src="https://img.shields.io/github/v/release/wrhc2010/OpenCine-AI?display_name=tag&sort=semver&style=flat-square" alt="最新版本" /></a>
+  <a href="https://github.com/wrhc2010/OpenCine-AI/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wrhc2010/OpenCine-AI?style=flat-square" alt="Apache-2.0 许可证" /></a>
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+" />
+  <img src="https://img.shields.io/badge/Docker%20Compose-ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker Compose" />
+</p>
+
 一个开源、模型无关的 **OpenCine-AI 视频制作** 编排系统。你只需要提供创意简报，它就会把需求整理成可版本化的制作计划，拆分场景与镜头，为每个镜头生成提示词和验收标准，调用视频模型，逐项检查结果，在失败后诊断原因并自动修复，最后完成连续性检查、音视频组装和交付。遇到重要决策时，系统会暂停并请求人工确认。
+
+## 产品预览
+
+<p align="center">
+  <img src="docs/screenshots/opencine-dashboard.png" alt="OpenCine-AI 制作控制台" width="49%" />
+  <img src="docs/screenshots/opencine-mobile.png" alt="OpenCine-AI 移动端布局" width="49%" />
+</p>
+
+桌面端聚焦项目配置、计划审批、镜头队列和验收状态；移动端保留核心导航与参数编辑，适合快速查看运行进度。
 
 本项目从一开始就坚持 **Agent-first（智能体优先）**：时间线只是执行结果，不是主要控制面板。项目状态、事件日志、来源追踪和质量门禁由本仓库负责维护；具体模型通过稳定的 Provider 适配器接入，因此不会被某一家模型或平台锁定。
 
