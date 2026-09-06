@@ -28,6 +28,7 @@ from ..schemas import (
     ProviderJob,
     RepairKind,
     Verdict,
+    new_id,
 )
 from .base import (
     JudgeInput,
@@ -46,6 +47,149 @@ class ProviderHTTPError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+def _json_path(value: Any, path: str | None) -> Any:
+    """Small, deterministic JSONPath subset used by WebUI providers."""
+    if not path:
+        return None
+    tokens = [token for token in str(path).lstrip("$").lstrip(".").replace("[", ".").replace("]", "").split(".") if token]
+    current = value
+    for token in tokens:
+        if isinstance(current, Mapping):
+            current = current.get(token)
+        elif isinstance(current, (list, tuple)) and token.isdigit():
+            index = int(token)
+            current = current[index] if index < len(current) else None
+        else:
+            return None
+    return current
+
+
+def _render_template(value: Any, context: Mapping[str, Any]) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _render_template(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_template(item, context) for item in value]
+    if isinstance(value, str):
+        rendered = value
+        for key, item in context.items():
+            rendered = rendered.replace("{{" + key + "}}", str(item))
+        return rendered
+    return value
+
+
+class TemplateHTTPVideoProvider(VideoGeneratorProvider):
+    """Config-driven HTTP adapter for OpenCine's custom Provider form."""
+
+    def __init__(self, config: Mapping[str, Any], *, client: JSONHTTPClient | None = None) -> None:
+        self.config = dict(config)
+        self.name = str(self.config.get("id") or self.config.get("name") or "custom-http")
+        self.client = client or JSONHTTPClient(timeout_seconds=float(self.config.get("timeout_seconds", 45)))
+
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(provider=self.name, models=[str(self.config.get("model", "custom"))], supports_async=bool(self.config.get("poll")), metadata={"protocol": "template-http"})
+
+    @staticmethod
+    def _normalize_status(value: Any, *, artifact_uri: Any = None, default: str = "queued") -> str:
+        status = str(value).strip().lower() if value is not None else ""
+        if status in {"completed", "success", "done", "succeeded"}:
+            return "succeeded"
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            return "cancelled" if status in {"cancelled", "canceled"} else "failed"
+        if status in {"queued", "pending"}:
+            return "queued"
+        if status in {"submitted"}:
+            return "submitted"
+        if status in {"running", "processing", "in_progress", "in-progress"}:
+            return "running"
+        if artifact_uri:
+            return "succeeded"
+        return status or default
+
+    def estimate_cost(self, request: VideoRequest) -> CostRecord:
+        amount = float(self.config.get("cost_per_second_usd", 0.0)) * float(request.shot.duration_seconds)
+        return CostRecord(amount, provider=self.name, model=request.model or self.config.get("model"), estimated=True)
+
+    def _context(self, request: VideoRequest, context: ProviderContext) -> dict[str, Any]:
+        return {
+            "prompt": request.prompt,
+            "negative_prompt": request.negative_prompt,
+            "parameters": request.parameters,
+            "model": request.model or self.config.get("model"),
+            "project_id": context.project_id,
+            "shot_id": context.shot_id or request.shot.id,
+            "callback_url": context.callback_url or "",
+            "references": request.reference_uris,
+        }
+
+    def _request(self, spec: Mapping[str, Any], context: Mapping[str, Any], *, default_url: str, default_method: str = "POST") -> Any:
+        url = str(spec.get("url") or default_url)
+        for key, value in context.items():
+            url = url.replace("{{" + key + "}}", str(value))
+        headers = _render_template(spec.get("headers") or self.config.get("headers") or {}, context)
+        if self.config.get("api_key") and not any(str(key).lower() == "authorization" for key in headers):
+            headers["Authorization"] = f"Bearer {self.config['api_key']}"
+        body = _render_template(spec.get("body_template") or {}, context)
+        return self.client.request(str(spec.get("method", default_method)).upper(), url, headers=headers, payload=body if body else None)
+
+    def submit(self, request: VideoRequest, context: ProviderContext) -> ProviderJob:
+        response = self._request(self.config, self._context(request, context), default_url=str(self.config.get("submit_url") or self.config.get("base_url")))
+        result = self.config.get("result") or {}
+        external_id = str(_json_path(response, result.get("job_id_path")) or _json_path(response, "$.id") or context.idempotency_key or new_id("custom-job"))
+        artifact_uri = _json_path(response, result.get("artifact_path"))
+        status = self._normalize_status(
+            _json_path(response, result.get("status_path")),
+            artifact_uri=artifact_uri,
+            default="queued",
+        )
+        metadata = {"response": response, "artifact_uri": artifact_uri, "result": result}
+        return ProviderJob(self.name, external_id, status=status, idempotency_key=context.idempotency_key, metadata=metadata)
+
+    def poll(self, job: ProviderJob) -> PollResult:
+        job.status = self._normalize_status(job.status, artifact_uri=job.metadata.get("artifact_uri"), default="queued")
+        if job.status == "succeeded" and job.metadata.get("artifact_uri"):
+            return PollResult(job, artifacts=self.fetch_artifacts(job))
+        poll = self.config.get("poll") or {}
+        if not poll:
+            return PollResult(job)
+        response = self._request(poll, {"external_id": job.external_id}, default_url=str(poll.get("url") or self.config.get("poll_url")), default_method="GET")
+        result = self.config.get("result") or {}
+        artifact_uri = _json_path(response, result.get("artifact_path"))
+        status = self._normalize_status(
+            _json_path(response, result.get("status_path")),
+            artifact_uri=artifact_uri,
+            default="running",
+        )
+        job.metadata = {**job.metadata, "response": response, "artifact_uri": artifact_uri}
+        job.status = status
+        return PollResult(job, artifacts=self.fetch_artifacts(job) if job.status == "succeeded" else [])
+
+    def fetch_artifacts(self, job: ProviderJob) -> list[ArtifactRef]:
+        uri = job.metadata.get("artifact_uri")
+        if not uri:
+            return []
+        values = uri if isinstance(uri, list) else [uri]
+        return [
+            ArtifactRef(AssetKind.VIDEO, item.strip(), metadata={"provider": self.name})
+            for item in values
+            if isinstance(item, str) and item.strip()
+        ]
+
+    def cancel(self, job: ProviderJob) -> None:
+        cancel_url = self.config.get("cancel_url")
+        if cancel_url:
+            self.client.request("POST", str(cancel_url).replace("{{external_id}}", job.external_id), payload={"id": job.external_id})
+
+    def normalize_error(self, error: Exception) -> ProviderError:
+        if isinstance(error, ProviderHTTPError):
+            retryable = error.status == 0 or error.status == 429 or error.status >= 500
+            code = "network_error" if error.status == 0 else f"http_{error.status}"
+            details = {"status": error.status}
+            if error.body is not None:
+                details["body"] = error.body
+            return ProviderError(code, str(error), retryable=retryable, provider=self.name, details=details)
+        return ProviderError("provider_error", str(error), retryable=True, provider=self.name)
 
 
 class JSONHTTPClient:

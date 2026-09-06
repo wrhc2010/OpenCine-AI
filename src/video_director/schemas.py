@@ -7,7 +7,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -203,7 +203,7 @@ class ClarificationTurn:
     source: str = "agent"
     confidence: float = 0.0
     confirmed: bool = False
-    options: list["ClarificationOption"] = field(default_factory=list)
+    options: list[ClarificationOption] = field(default_factory=list)
     skipped: bool = False
     id: str = field(default_factory=lambda: new_id("clar"))
 
@@ -772,10 +772,18 @@ class Project:
     # the end preserves the positional constructor shape used by early
     # integrations while allowing storage adapters to perform CAS writes.
     revision: int = 0
+    # Logical project lineage. Delivered snapshots remain immutable while a
+    # new version receives its own project id and can run independently.
+    root_project_id: str | None = None
+    parent_project_id: str | None = None
+    version: int = 1
 
     @property
     def active_plan(self) -> PlanVersion | None:
-        return self.plans[-1] if self.plans else None
+        for plan in reversed(self.plans):
+            if getattr(plan, "status", "draft") != "obsolete":
+                return plan
+        return None
 
     def add_cost(self, cost: CostRecord) -> None:
         self.total_cost_usd += cost.amount_usd

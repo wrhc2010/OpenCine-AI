@@ -5,14 +5,14 @@ the API stack, while installing `.[api]` exposes a ready-to-run app.
 """
 from __future__ import annotations
 
-import json
 import base64
 import hashlib
+import json
 import os
 import secrets
 import time
-from datetime import UTC, datetime, timedelta
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 try:
@@ -21,8 +21,16 @@ try:
 except ImportError as error:  # pragma: no cover - exercised when API extras are absent
     raise RuntimeError("FastAPI is optional; install ai-video-director[api] to run the API") from error
 
+from . import __version__
 from .cli import build_mock_orchestrator, build_orchestrator
 from .execution import BudgetExceeded, HumanGate
+from .providers.http import (
+    ComfyUIProvider,
+    FalLikeAsyncVideoProvider,
+    JSONHTTPClient,
+    TemplateHTTPVideoProvider,
+)
+from .providers.mock import MockVideoProvider
 from .queue import make_job_queue
 from .scheduler import ProjectJobHandler, queue_project_run
 from .schemas import CreativeBrief, Project, ProjectStatus, as_jsonable, stable_hash
@@ -33,13 +41,40 @@ def _brief(payload: dict[str, Any]) -> CreativeBrief:
     if not isinstance(payload, dict):
         raise TypeError("creative brief must be a JSON object")
     allowed = {field for field in CreativeBrief.__dataclass_fields__}
+    values = {key: value for key, value in payload.items() if key in allowed}
+    defaults = {
+        "duration_seconds": 150.0,
+        "shot_duration_seconds": 15.0,
+        "max_shots": 10,
+        "budget_usd": 75.0,
+        "acceptance_mode": "standard",
+    }
+    for key, fallback in defaults.items():
+        if key not in values:
+            setting_key = {
+                "duration_seconds": "DIRECTOR_DEFAULT_DURATION_SECONDS",
+                "shot_duration_seconds": "DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS",
+                "max_shots": "DIRECTOR_DEFAULT_MAX_SHOTS",
+                "budget_usd": "DIRECTOR_PROJECT_BUDGET_USD",
+                "acceptance_mode": "DIRECTOR_DEFAULT_ACCEPTANCE_MODE",
+            }[key]
+            raw = orchestrator.store.get_setting(setting_key)
+            if raw is None:
+                raw = os.getenv(setting_key)
+            if raw is not None:
+                try:
+                    values[key] = float(raw) if key in {"duration_seconds", "shot_duration_seconds", "budget_usd"} else int(raw) if key == "max_shots" else str(raw)
+                except (TypeError, ValueError):
+                    values[key] = fallback
+            else:
+                values[key] = fallback
     try:
-        return CreativeBrief(**{key: value for key, value in payload.items() if key in allowed})
+        return CreativeBrief(**values)
     except TypeError as error:
         raise ValueError(f"Invalid creative brief: {error}") from error
 
 
-app = FastAPI(title="AI Video Director", version="0.1.0")
+app = FastAPI(title="AI Video Director", version=__version__)
 store_path = os.getenv("DIRECTOR_DATABASE_URL", "sqlite:///.data/api.db")
 try:
     orchestrator = build_orchestrator(store_path=store_path, fail_first_attempts=1)
@@ -67,6 +102,110 @@ def _auth_enabled() -> bool:
     return _bool_env("DIRECTOR_AUTH_ENABLED", True) if stored is None else _as_bool(stored)
 
 
+def _custom_providers() -> list[dict[str, Any]]:
+    raw = orchestrator.store.get_setting(CUSTOM_PROVIDER_SETTING_KEY)
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _masked_provider(provider: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(provider)
+    for key in ("api_key", "token", "secret"):
+        if result.get(key):
+            result[key] = "********"
+    return result
+
+
+def _masked_custom_providers() -> list[dict[str, Any]]:
+    return [_masked_provider(item) for item in _custom_providers() if isinstance(item, Mapping)]
+
+
+def _save_custom_providers(value: list[dict[str, Any]]) -> None:
+    orchestrator.store.set_setting(CUSTOM_PROVIDER_SETTING_KEY, json.dumps(value, ensure_ascii=False))
+    _reload_custom_video_provider()
+
+
+def _reload_custom_video_provider() -> None:
+    selected = str(orchestrator.store.get_setting("VIDEO_PROVIDER") or os.getenv("VIDEO_PROVIDER", "mock")).strip()
+    normalized = selected.casefold()
+    provider = None
+    if normalized.startswith("custom:") or any(
+        str(item.get("id", "")).casefold() == normalized
+        for item in _custom_providers()
+        if isinstance(item, Mapping)
+    ):
+        provider_id = normalized.removeprefix("custom:")
+        config = next(
+            (
+                item
+                for item in _custom_providers()
+                if isinstance(item, Mapping)
+                and str(item.get("id", "")).casefold() == provider_id
+                and item.get("capability", "video") == "video"
+            ),
+            None,
+        )
+        if config is None:
+            raise ValueError(f"Unknown custom VIDEO_PROVIDER: {provider_id}")
+        provider = TemplateHTTPVideoProvider(config)
+    elif normalized in {"mock", "mock-video"}:
+        provider = orchestrator.video_providers.get("mock-video") or MockVideoProvider(
+            fail_first_attempts=0,
+            cost_usd=float(os.getenv("MOCK_VIDEO_COST_USD", "1.25")),
+        )
+    elif normalized in {"fal", "fal-like", "replicate"}:
+        provider = next(
+            (candidate for name, candidate in orchestrator.video_providers.items() if name.casefold() in {"fal", "fal-like", "fal-like-video"}),
+            None,
+        )
+        if provider is None:
+            base_url = os.getenv("FAL_BASE_URL") or os.getenv("REPLICATE_BASE_URL")
+            if not base_url:
+                raise ValueError("FAL_BASE_URL or REPLICATE_BASE_URL is required for the cloud provider")
+            provider = FalLikeAsyncVideoProvider(
+                base_url,
+                api_key=orchestrator.store.get_setting("FAL_API_KEY") or os.getenv("FAL_API_KEY") or os.getenv("REPLICATE_API_TOKEN"),
+                model=orchestrator.store.get_setting("VIDEO_MODEL") or os.getenv("VIDEO_MODEL", "video-model"),
+                cost_per_second_usd=float(os.getenv("VIDEO_COST_PER_SECOND_USD", "0.25")),
+            )
+    elif normalized == "comfyui":
+        provider = orchestrator.video_providers.get("comfyui") or ComfyUIProvider(os.getenv("COMFYUI_BASE_URL", "http://localhost:8188"))
+    else:
+        provider = next((candidate for name, candidate in orchestrator.video_providers.items() if name.casefold() == normalized), None)
+    if provider is None:
+        raise ValueError(f"Unsupported VIDEO_PROVIDER: {selected}")
+    orchestrator.video_provider = provider
+    orchestrator.video_providers[provider.name] = provider
+
+
+def _validate_custom_provider(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload.get("id"), str) or not payload["id"].strip():
+        raise HTTPException(400, "Provider id 不能为空")
+    if not isinstance(payload.get("name"), str) or not payload["name"].strip():
+        raise HTTPException(400, "Provider 名称不能为空")
+    capability = payload.get("capability", "video")
+    if capability not in {"video", "llm", "vlm", "audio", "reference"}:
+        raise HTTPException(400, "不支持的 Provider 能力类型")
+    endpoint = payload.get("submit_url") or payload.get("base_url")
+    if not isinstance(endpoint, str) or not endpoint.startswith(("http://", "https://")):
+        raise HTTPException(400, "Provider URL 必须使用 http:// 或 https://")
+    result = dict(payload)
+    result["id"] = payload["id"].strip()
+    result["name"] = payload["name"].strip()
+    result["capability"] = capability
+    result.setdefault("method", "POST")
+    result.setdefault("headers", {})
+    result.setdefault("body_template", {})
+    result.setdefault("poll", {})
+    result.setdefault("result", {})
+    return result
+
+
 SETTING_DEFAULTS: dict[str, Any] = {
     "DIRECTOR_AUTH_ENABLED": True,
     "DIRECTOR_HOST_CHECK_ENABLED": False,
@@ -81,11 +220,18 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "VIDEO_MODEL": "video-model",
     "DIRECTOR_LLM_MODEL": "gpt-4o-mini",
     "DIRECTOR_VLM_MODEL": "",
+    "DIRECTOR_DEFAULT_DURATION_SECONDS": 150.0,
+    "DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS": 15.0,
+    "DIRECTOR_DEFAULT_MAX_SHOTS": 10,
+    "DIRECTOR_DEFAULT_ACCEPTANCE_MODE": "standard",
+    "LLM_PROVIDER": "openai-compatible-llm",
+    "VLM_PROVIDER": "openai-compatible-vlm-judge",
 }
 SETTING_KEYS = set(SETTING_DEFAULTS) | {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
 SECRET_SETTING_KEYS = {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
 CONNECTION_SETTING_KEYS = {"DIRECTOR_DATABASE_URL", "REDIS_URL", "OBJECT_STORAGE_ENDPOINT"}
 SETTING_KEYS |= CONNECTION_SETTING_KEYS
+CUSTOM_PROVIDER_SETTING_KEY = "CUSTOM_PROVIDERS"
 RESTART_SETTING_KEYS = {
     "DIRECTOR_DATABASE_URL",
     "REDIS_URL",
@@ -209,6 +355,47 @@ def get_settings() -> dict[str, Any]:
     }
 
 
+BASIC_SETTING_KEYS = {
+    "VIDEO_PROVIDER", "VIDEO_MODEL", "DIRECTOR_LLM_MODEL", "DIRECTOR_VLM_MODEL",
+    "LLM_PROVIDER", "VLM_PROVIDER", "DIRECTOR_PROJECT_BUDGET_USD", "DIRECTOR_PARALLELISM",
+    "DIRECTOR_DEFAULT_DURATION_SECONDS", "DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS",
+    "DIRECTOR_DEFAULT_MAX_SHOTS", "DIRECTOR_DEFAULT_ACCEPTANCE_MODE",
+    *SECRET_SETTING_KEYS,
+}
+ADVANCED_SETTING_KEYS = SETTING_KEYS - BASIC_SETTING_KEYS
+
+
+def _settings_subset(keys: set[str]) -> dict[str, Any]:
+    full = get_settings()
+    return {key: full["settings"].get(key, "") for key in sorted(keys) if key in full["settings"]}
+
+
+@app.get("/v1/settings/basic")
+def get_basic_settings() -> dict[str, Any]:
+    return {"settings": _settings_subset(BASIC_SETTING_KEYS), "providers": _masked_custom_providers()}
+
+
+@app.patch("/v1/settings/basic")
+def update_basic_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(payload) - BASIC_SETTING_KEYS)
+    if unknown:
+        raise HTTPException(400, f"不支持的普通设置：{', '.join(unknown)}")
+    return update_settings(payload)
+
+
+@app.get("/v1/settings/advanced")
+def get_advanced_settings() -> dict[str, Any]:
+    return {"settings": _settings_subset(ADVANCED_SETTING_KEYS), "requires_restart": sorted(RESTART_SETTING_KEYS)}
+
+
+@app.patch("/v1/settings/advanced")
+def update_advanced_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(payload) - ADVANCED_SETTING_KEYS)
+    if unknown:
+        raise HTTPException(400, f"不支持的高级设置：{', '.join(unknown)}")
+    return update_settings(payload)
+
+
 @app.patch("/v1/settings")
 def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
@@ -241,6 +428,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         elif not isinstance(value, (str, int, float, bool)):
             raise HTTPException(400, f"设置项必须是简单值：{key}")
         orchestrator.store.set_setting(key, str(value))
+    _reload_custom_video_provider()
     return get_settings()
 
 
@@ -282,6 +470,23 @@ def create_project(payload: dict[str, Any]) -> dict[str, Any]:
     return project_view(project)
 
 
+@app.get("/v1/projects")
+def list_projects() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": project.id,
+            "name": project.name,
+            "status": project.status.value,
+            "version": project.version,
+            "root_project_id": project.root_project_id or project.id,
+            "parent_project_id": project.parent_project_id,
+            "updated_at": project.updated_at.isoformat(),
+            "total_cost_usd": project.total_cost_usd,
+        }
+        for project in orchestrator.store.list_projects()
+    ]
+
+
 @app.get("/v1/projects/{project_id}/settings")
 def get_project_settings(project_id: str) -> dict[str, Any]:
     project = _get(project_id)
@@ -308,6 +513,32 @@ def update_project_settings(project_id: str, payload: dict[str, Any]) -> dict[st
         project.transition(ProjectStatus.AWAITING_PLAN_APPROVAL, force=True)
     orchestrator.store.save_project(project, event_type="project.settings.updated", payload={"keys": sorted(payload)})
     return get_project_settings(project_id)
+
+
+@app.post("/v1/projects/{project_id}/versions", status_code=201)
+def create_project_version(project_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = _get(project_id)
+    try:
+        return project_view(orchestrator.create_project_version(source, actor=str((payload or {}).get("actor", "human"))))
+    except HumanGate as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/v1/projects/{project_id}/rewind")
+def rewind_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    project = _get(project_id)
+    target = payload.get("target_phase") if isinstance(payload, dict) else None
+    if not isinstance(target, str):
+        raise HTTPException(400, "target_phase is required")
+    expected = payload.get("expected_revision") if isinstance(payload, dict) else None
+    if expected is not None and expected != project.revision:
+        raise SnapshotConflict(project.id, int(expected), project.revision)
+    try:
+        return project_view(orchestrator.rewind(project, target, actor=str(payload.get("actor", "human")), reason=str(payload.get("reason", "operator rewind"))))
+    except HumanGate as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
 
 
 @app.get("/v1/projects/{project_id}")
@@ -415,6 +646,60 @@ def providers() -> list[dict[str, Any]]:
             capabilities = {"provider": name, "error": str(error)}
         unique[name] = capabilities
     return list(unique.values())
+
+
+@app.get("/v1/providers/custom")
+def custom_providers() -> list[dict[str, Any]]:
+    return _masked_custom_providers()
+
+
+@app.post("/v1/providers/custom", status_code=201)
+def create_custom_provider(payload: dict[str, Any]) -> dict[str, Any]:
+    provider = _validate_custom_provider(payload)
+    providers_value = _custom_providers()
+    if any(item.get("id") == provider["id"] for item in providers_value):
+        raise HTTPException(409, "Provider id 已存在")
+    providers_value.append(provider)
+    _save_custom_providers(providers_value)
+    return _masked_provider(provider)
+
+
+@app.patch("/v1/providers/custom/{provider_id}")
+def update_custom_provider(provider_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    providers_value = _custom_providers()
+    current = next((item for item in providers_value if item.get("id") == provider_id), None)
+    if current is None:
+        raise HTTPException(404, "custom provider not found")
+    merged = {**current, **payload, "id": provider_id}
+    if payload.get("api_key") in {"********", "已配置"}:
+        merged["api_key"] = current.get("api_key", "")
+    provider = _validate_custom_provider(merged)
+    providers_value[providers_value.index(current)] = provider
+    _save_custom_providers(providers_value)
+    return _masked_provider(provider)
+
+
+@app.delete("/v1/providers/custom/{provider_id}")
+def delete_custom_provider(provider_id: str) -> dict[str, Any]:
+    providers_value = _custom_providers()
+    filtered = [item for item in providers_value if item.get("id") != provider_id]
+    if len(filtered) == len(providers_value):
+        raise HTTPException(404, "custom provider not found")
+    _save_custom_providers(filtered)
+    return {"id": provider_id, "deleted": True}
+
+
+@app.post("/v1/providers/custom/{provider_id}/test")
+def test_custom_provider(provider_id: str) -> dict[str, Any]:
+    provider = next((item for item in _custom_providers() if item.get("id") == provider_id), None)
+    if provider is None:
+        raise HTTPException(404, "custom provider not found")
+    url = provider.get("test_url") or provider.get("submit_url") or provider.get("base_url")
+    try:
+        response = JSONHTTPClient(timeout_seconds=10).request(str(provider.get("method", "GET")), str(url), headers=provider.get("headers") or {}, payload=provider.get("test_body") or None)
+        return {"ok": True, "provider_id": provider_id, "response": response if isinstance(response, (dict, list, str, int, float, bool)) else str(response)}
+    except Exception as error:  # noqa: BLE001 - surface a safe connection test result
+        return {"ok": False, "provider_id": provider_id, "error": str(error)}
 
 
 @app.post("/v1/projects/{project_id}/approve-plan")

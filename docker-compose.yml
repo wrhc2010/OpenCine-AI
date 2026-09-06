@@ -1,5 +1,6 @@
 services:
   api:
+    image: ${OPENCINE_API_IMAGE:-ghcr.io/wrhc2010/opencine-ai-api}:${OPENCINE_IMAGE_TAG:-v0.1.1}
     build:
       context: .
       dockerfile: docker/api.Dockerfile
@@ -30,6 +31,7 @@ services:
       timeout: 5s
       retries: 10
   worker:
+    image: ${OPENCINE_API_IMAGE:-ghcr.io/wrhc2010/opencine-ai-api}:${OPENCINE_IMAGE_TAG:-v0.1.1}
     build:
       context: .
       dockerfile: docker/api.Dockerfile
@@ -87,6 +89,7 @@ services:
       "until mc alias set local http://minio:9000 director director-secret; do sleep 2; done;
       mc mb --ignore-existing local/video-director"
   web:
+    image: ${OPENCINE_WEB_IMAGE:-ghcr.io/wrhc2010/opencine-ai-web}:${OPENCINE_IMAGE_TAG:-v0.1.1}
     build:
       context: .
       dockerfile: docker/web.Dockerfile

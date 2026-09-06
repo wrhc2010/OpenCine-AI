@@ -27,7 +27,6 @@ from .schemas import (
     AudioCue,
     CharacterBible,
     ClarificationTurn,
-    ClarificationOption,
     CostRecord,
     CreativeBrief,
     CriterionCategory,
@@ -253,6 +252,12 @@ class EventStore:
         project.revision = max(0, int(row["revision"] or 0))
         return project
 
+    def list_projects(self) -> list[Project]:
+        """Return durable projects newest first for the operator console."""
+        with self._lock:
+            rows = self.connection.execute("SELECT snapshot FROM projects ORDER BY updated_at DESC").fetchall()
+        return [decode_project(json.loads(row["snapshot"])) for row in rows]
+
     def claim_idempotency(
         self, project_id: str, key: str, result: Any | None = None
     ) -> tuple[bool, Any | None]:
@@ -459,6 +464,12 @@ class PostgresEventStore:
         project = decode_project(row[0])
         project.revision = max(0, int(row[1] or 0))
         return project
+
+    def list_projects(self) -> list[Project]:
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT snapshot FROM projects ORDER BY updated_at DESC")
+            rows = cursor.fetchall()
+        return [decode_project(row[0]) for row in rows]
 
     def claim_idempotency(self, project_id: str, key: str, result: Any | None = None) -> tuple[bool, Any | None]:
         encoded = json.dumps(as_jsonable(result)) if result is not None else None
@@ -963,6 +974,9 @@ def _legacy_decode_project(raw: Mapping[str, Any]) -> Project:
         created_at=_dt(raw.get("created_at")),
         updated_at=_dt(raw.get("updated_at")),
         revision=_integer(raw.get("revision"), 0, minimum=0),
+        root_project_id=_string(raw.get("root_project_id")) or None,
+        parent_project_id=_string(raw.get("parent_project_id")) or None,
+        version=_integer(raw.get("version"), 1, minimum=1),
     )
 
 
@@ -1141,6 +1155,9 @@ def decode_project(raw: Mapping[str, Any]) -> Project:
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
         "revision": _integer(raw.get("revision"), 0, minimum=0),
+        "root_project_id": _string(raw.get("root_project_id")) or None,
+        "parent_project_id": _string(raw.get("parent_project_id")) or None,
+        "version": _integer(raw.get("version"), 1, minimum=1),
     }
     plan_values = _items(raw.get("plans"))
     sanitized["plans"] = [

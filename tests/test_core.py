@@ -518,6 +518,31 @@ def test_plan_rollback_clones_ids_and_records_soft_budget_warning(tmp_path):
     assert rolled.status.value == "awaiting_plan_approval"
 
 
+def test_project_version_clones_plan_entities_and_invalidates_rewound_delivery(tmp_path):
+    orchestrator = build_mock_orchestrator(store_path=tmp_path / "project-version.db", fail_first_attempts=0)
+    project = ready_project(orchestrator, shots=1, budget=20)
+    project = orchestrator.run(project)
+    project = orchestrator.deliver(project)
+    source_plan = project.active_plan
+    source_shot = source_plan.shots[0]
+    source_delivery = project.artifacts[-1]
+
+    version = orchestrator.create_project_version(project, actor="reviewer")
+
+    assert version.version == 2
+    assert version.root_project_id == project.root_project_id == project.id
+    assert version.parent_project_id == project.id
+    assert version.active_plan.id != source_plan.id
+    assert version.active_plan.shots[0].id != source_shot.id
+
+    orchestrator.rewind(project, "plan", actor="reviewer", reason="change the story structure")
+
+    assert project.active_plan is None
+    assert source_delivery.metadata["active"] is False
+    assert source_delivery.metadata["superseded"] is True
+    assert all(attempt.status == "invalidated" for attempt in project.attempts)
+
+
 def test_run_is_idempotent_after_assembly(tmp_path):
     orchestrator = build_mock_orchestrator(store_path=tmp_path / "assembly-idempotent.db", fail_first_attempts=0)
     project = ready_project(orchestrator, shots=1, budget=20)

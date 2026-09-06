@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-video-director"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent-first, provider-agnostic orchestration for AI video production"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,4 +33,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q"

@@ -6,7 +6,11 @@ import json
 import os
 
 from .execution import DirectorOrchestrator
-from .providers.http import ComfyUIProvider, FalLikeAsyncVideoProvider
+from .providers.http import (
+    ComfyUIProvider,
+    FalLikeAsyncVideoProvider,
+    TemplateHTTPVideoProvider,
+)
 from .providers.mock import (
     MockAssembler,
     MockAudioProvider,
@@ -54,7 +58,14 @@ def build_orchestrator(
     parallelism: int | None = None,
 ) -> DirectorOrchestrator:
     """Build the configured adapter set without leaking vendor details."""
-    provider_name = os.getenv("VIDEO_PROVIDER", "mock").strip().lower()
+    store = make_event_store(store_path)
+    configured_custom = store.get_setting("CUSTOM_PROVIDERS")
+    try:
+        custom_providers = json.loads(configured_custom) if configured_custom else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        custom_providers = []
+    provider_name = os.getenv("VIDEO_PROVIDER") or store.get_setting("VIDEO_PROVIDER") or "mock"
+    provider_name = provider_name.strip().lower()
     if provider_name == "mock":
         video_provider = MockVideoProvider(
             fail_first_attempts=fail_first_attempts,
@@ -72,6 +83,12 @@ def build_orchestrator(
         )
     elif provider_name == "comfyui":
         video_provider = ComfyUIProvider(os.getenv("COMFYUI_BASE_URL", "http://localhost:8188"))
+    elif provider_name.startswith("custom:") or any(item.get("id", "").lower() == provider_name for item in custom_providers if isinstance(item, dict)):
+        custom_id = provider_name.removeprefix("custom:")
+        config = next((item for item in custom_providers if isinstance(item, dict) and item.get("id", "").lower() == custom_id), None)
+        if config is None:
+            raise ValueError(f"Unknown custom VIDEO_PROVIDER: {custom_id}")
+        video_provider = TemplateHTTPVideoProvider(config)
     else:
         raise ValueError(f"Unsupported VIDEO_PROVIDER: {provider_name}")
     return DirectorOrchestrator(
@@ -79,7 +96,7 @@ def build_orchestrator(
         judge_provider=MockJudgeProvider(),
         assembler=MockAssembler(),
         audio_provider=MockAudioProvider(),
-        store=make_event_store(store_path),
+        store=store,
         max_attempts=int(os.getenv("DIRECTOR_MAX_ATTEMPTS", "3")),
         parallelism=_parallelism_from_env() if parallelism is None else parallelism,
     )

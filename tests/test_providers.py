@@ -18,6 +18,7 @@ from video_director.providers.http import (
     OpenAICompatibleLLMProvider,
     OpenAICompatibleVLMJudgeProvider,
     ProviderHTTPError,
+    TemplateHTTPVideoProvider,
 )
 from video_director.schemas import (
     AcceptanceCriterion,
@@ -210,6 +211,33 @@ def test_fal_like_rejects_submit_and_poll_model_mismatch():
     result = provider.poll(job)
     assert result.job.status == "failed"
     assert result.error is not None and "different model" in result.error.message
+
+
+def test_template_http_provider_normalizes_terminal_submit_status_and_artifact():
+    client = FakeHTTPClient([
+        {"id": "job-1", "status": "completed", "output": {"video_url": "mock://done.mp4"}},
+    ])
+    provider = TemplateHTTPVideoProvider(
+        {
+            "id": "custom-video",
+            "name": "Custom video",
+            "submit_url": "https://provider.test/submit",
+            "api_key": "secret",
+            "body_template": {"prompt": "{{prompt}}"},
+            "result": {
+                "job_id_path": "$.id",
+                "status_path": "$.status",
+                "artifact_path": "$.output.video_url",
+            },
+        },
+        client=client,
+    )
+
+    job = provider.submit(request(), ProviderContext("project", "shot", "idem-custom"))
+
+    assert job.status == "succeeded"
+    assert provider.poll(job).artifacts[0].uri == "mock://done.mp4"
+    assert client.calls[0][1] == "https://provider.test/submit"
 
 
 @pytest.mark.parametrize(

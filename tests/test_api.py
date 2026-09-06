@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from video_director.api import app, queue
+from video_director.cli import build_mock_orchestrator
 from video_director.store import SnapshotConflict
 
 
@@ -218,3 +219,79 @@ def test_api_returns_conflict_contract_for_stale_snapshot(monkeypatch):
     assert body["expected_revision"] == 1
     assert body["actual_revision"] == 2
     assert body["retryable"] is True
+
+
+def test_api_project_lineage_rewind_settings_and_custom_provider(monkeypatch, tmp_path):
+    replacement = build_mock_orchestrator(store_path=tmp_path / "workflow.db", fail_first_attempts=0)
+    monkeypatch.setattr("video_director.api.orchestrator", replacement)
+    monkeypatch.setattr("video_director.api.projects", {})
+    client = TestClient(app)
+    brief = {
+        "title": "Workflow fixture",
+        "request": "Lin returns a letter in a city at dawn.",
+        "duration_seconds": 15,
+        "shot_duration_seconds": 15,
+        "max_shots": 1,
+        "budget_usd": 20,
+    }
+
+    source = client.post("/v1/projects", json=brief).json()
+    answers = {turn["id"]: "Approved" for turn in source["clarification_turns"]}
+    client.post(f"/v1/projects/{source['id']}/clarifications", json=answers)
+    client.post(f"/v1/projects/{source['id']}/plan")
+    running = client.post(f"/v1/projects/{source['id']}/run", json={"approve_plan": True})
+    assert running.status_code == 200
+    delivered = client.post(f"/v1/projects/{source['id']}/deliver")
+    assert delivered.status_code == 200
+    delivered_project = delivered.json()
+
+    listed = client.get("/v1/projects")
+    assert listed.status_code == 200
+    assert listed.json()[0]["root_project_id"] == source["id"]
+
+    version = client.post(f"/v1/projects/{source['id']}/versions", json={"actor": "api-test"})
+    assert version.status_code == 201
+    version_project = version.json()
+    assert version_project["version"] == 2
+    assert version_project["parent_project_id"] == source["id"]
+    assert version_project["plans"][0]["id"] != delivered_project["plans"][0]["id"]
+    assert version_project["plans"][0]["shots"][0]["id"] != delivered_project["plans"][0]["shots"][0]["id"]
+
+    rewound = client.post(
+        f"/v1/projects/{source['id']}/rewind",
+        json={"target_phase": "plan", "expected_revision": delivered_project["revision"], "reason": "revise"},
+    )
+    assert rewound.status_code == 200
+    assert rewound.json()["status"] == "awaiting_plan_approval"
+    assert rewound.json()["artifacts"][-1]["metadata"]["active"] is False
+
+    basic = client.get("/v1/settings/basic")
+    advanced = client.get("/v1/settings/advanced")
+    assert basic.status_code == 200 and "VIDEO_PROVIDER" in basic.json()["settings"]
+    assert advanced.status_code == 200 and "DIRECTOR_DATABASE_URL" in advanced.json()["settings"]
+    assert client.patch("/v1/settings/basic", json={"DIRECTOR_DEFAULT_DURATION_SECONDS": 45}).status_code == 200
+    assert client.patch("/v1/settings/advanced", json={"DIRECTOR_MAX_ATTEMPTS": 4}).status_code == 200
+
+    provider = client.post(
+        "/v1/providers/custom",
+        json={
+            "id": "workflow-provider",
+            "name": "Workflow Provider",
+            "capability": "video",
+            "submit_url": "https://provider.test/submit",
+            "api_key": "super-secret",
+            "body_template": {"prompt": "{{prompt}}"},
+        },
+    )
+    assert provider.status_code == 201
+    assert provider.json()["api_key"] == "********"
+    assert client.get("/v1/providers/custom").json()[0]["api_key"] == "********"
+    updated = client.patch("/v1/providers/custom/workflow-provider", json={"api_key": "********", "model": "v2"})
+    assert updated.status_code == 200 and updated.json()["api_key"] == "********"
+    assert client.patch("/v1/settings/basic", json={"VIDEO_PROVIDER": "custom:workflow-provider"}).status_code == 200
+    assert replacement.video_provider.name == "workflow-provider"
+    assert client.patch("/v1/settings/basic", json={"VIDEO_PROVIDER": "mock"}).status_code == 200
+    assert replacement.video_provider.name == "mock-video"
+    assert client.delete("/v1/providers/custom/workflow-provider").json()["deleted"] is True
+
+    replacement.store.close()

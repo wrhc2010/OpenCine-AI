@@ -70,8 +70,17 @@ API 默认使用本地 SQLite 文件（`.data/director.db`）和 Mock Provider�
 ### Docker Compose
 
 ```bash
+# 使用 GitHub Container Registry 中的 v0.1.1 发布镜像
+docker compose pull api worker web
+docker compose up -d
+
+# 或从当前工作区重新构建镜像
 docker compose up -d --build
 ```
+
+发布镜像为 `ghcr.io/wrhc2010/opencine-ai-api:v0.1.1` 和
+`ghcr.io/wrhc2010/opencine-ai-web:v0.1.1`；每次发布版本也会同步更新
+`latest` 标签。Compose 通过 `OPENCINE_IMAGE_TAG` 选择镜像版本。
 
 启动后访问：
 
@@ -85,10 +94,10 @@ docker compose up -d --build
 
 WebUI 的“项目配置”可以调整视频总时长、单个镜头时长、并发、分辨率和 AI 验收标准。并发、分辨率和验收支持自动、预设或自定义值；计划生成后会展示实际生效值，修改项目参数会使计划回到审批状态。
 
-全局“高级设置”用于 Provider、模型、默认预算、默认并发和安全开关。配置优先级为：
+全局设置分为“普通设置”和“高级设置”：普通设置管理 Provider、模型、默认预算、默认并发和默认验收策略；高级设置管理数据库、Redis、对象存储、认证、Host、CORS、限流及安全策略。配置优先级为：
 
 ```text
-项目配置 > 全局高级设置 > 环境变量 > 内置默认值
+项目配置 > 全局设置 > 环境变量 > 内置默认值
 ```
 
 API Key 只显示“已配置”，不会回显原文。数据库、Redis、对象存储和 Provider 凭证等连接配置在新任务或服务重启后完全生效，请勿将真实凭证提交到 Git。

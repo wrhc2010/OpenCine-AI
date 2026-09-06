@@ -33,6 +33,7 @@ from .schemas import (
     AudioCue,
     CostRecord,
     CreativeBrief,
+    PlanVersion,
     Project,
     ProjectStatus,
     PromptBundle,
@@ -114,9 +115,131 @@ class DirectorOrchestrator:
         if errors:
             raise ValueError("Invalid creative brief: " + "; ".join(errors))
         project = Project(brief.title, brief)
+        project.root_project_id = project.id
         project.clarification_turns = self.clarifier.inspect(brief)
         project.transition(ProjectStatus.CLARIFYING if project.clarification_turns else ProjectStatus.AWAITING_PLAN_APPROVAL)
         self.store.save_project(project, event_type="project.created")
+        return project
+
+    @staticmethod
+    def _clone_plan(plan: PlanVersion, *, version: int, brief: CreativeBrief | None = None) -> PlanVersion:
+        """Clone a plan without carrying entity identity into another snapshot."""
+        restored = deepcopy(plan)
+        reference_ids = {asset.id: new_id("asset") for asset in restored.reference_assets}
+        character_ids = {character.id: new_id("char") for character in restored.characters}
+        location_ids = {location.id: new_id("loc") for location in restored.locations}
+        scene_ids = {scene.id: new_id("scene") for scene in restored.scenes}
+        shot_ids = {shot.id: new_id("shot") for shot in restored.shots}
+
+        for asset in restored.reference_assets:
+            asset.id = reference_ids[asset.id]
+        for character in restored.characters:
+            character.id = character_ids[character.id]
+            character.reference_asset_ids = [reference_ids.get(item, item) for item in character.reference_asset_ids]
+        for location in restored.locations:
+            location.id = location_ids[location.id]
+            location.reference_asset_ids = [reference_ids.get(item, item) for item in location.reference_asset_ids]
+        if restored.style_bible is not None:
+            restored.style_bible = replace(restored.style_bible, id=new_id("style"))
+        for scene in restored.scenes:
+            scene.id = scene_ids[scene.id]
+            scene.location_id = location_ids.get(scene.location_id, scene.location_id)
+            scene.shot_ids = [shot_ids.get(item, item) for item in scene.shot_ids]
+        for shot in restored.shots:
+            old_id = shot.id
+            shot.id = shot_ids[old_id]
+            shot.scene_id = scene_ids.get(shot.scene_id, shot.scene_id)
+            shot.character_ids = [character_ids.get(item, item) for item in shot.character_ids]
+            shot.location_id = location_ids.get(shot.location_id, shot.location_id)
+            shot.previous_shot_id = shot_ids.get(shot.previous_shot_id, shot.previous_shot_id)
+            shot.next_shot_id = shot_ids.get(shot.next_shot_id, shot.next_shot_id)
+            shot.depends_on_shot_ids = [shot_ids.get(item, item) for item in shot.depends_on_shot_ids]
+            shot.acceptance_criteria = [replace(criterion, id=new_id("criterion")) for criterion in shot.acceptance_criteria]
+            if shot.prompt_bundle is not None:
+                shot.prompt_bundle = replace(
+                    shot.prompt_bundle,
+                    reference_asset_ids=[reference_ids.get(item, item) for item in shot.prompt_bundle.reference_asset_ids],
+                    id=new_id("prompt"),
+                )
+        restored.audio_cues = [replace(cue, id=new_id("cue")) for cue in restored.audio_cues]
+        restored.version = version
+        restored.id = new_id("plan")
+        restored.status = "draft"
+        restored.approved_by = None
+        if brief is not None:
+            restored.brief = deepcopy(brief)
+        return restored
+
+    @staticmethod
+    def _invalidate_downstream(project: Project, reason: str) -> None:
+        for attempt in project.attempts:
+            if attempt.status != "invalidated":
+                attempt.status = "invalidated"
+        for artifact in project.artifacts:
+            metadata = dict(artifact.metadata) if isinstance(artifact.metadata, dict) else {}
+            metadata.update({"superseded": True, "invalidated": True, "superseded_reason": reason})
+            if metadata.get("artifact_role") == "delivery":
+                metadata["active"] = False
+            artifact.metadata = metadata
+
+    def create_project_version(self, source: Project, *, actor: str = "human") -> Project:
+        """Create an independent rerun while retaining the delivered source."""
+        if source.status not in {ProjectStatus.DELIVERED, ProjectStatus.FAILED, ProjectStatus.CANCELLED, ProjectStatus.AWAITING_HUMAN}:
+            raise HumanGate(f"Project versioning is not allowed while project is {source.status.value}")
+        root_id = source.root_project_id or source.id
+        siblings = self.store.list_projects()
+        next_version = max((item.version for item in siblings if (item.root_project_id or item.id) == root_id), default=source.version) + 1
+        project = Project(
+            name=f"{source.brief.title} v{next_version}",
+            brief=deepcopy(source.brief),
+            status=ProjectStatus.CLARIFYING,
+            clarification_turns=deepcopy(source.clarification_turns),
+            root_project_id=root_id,
+            parent_project_id=source.id,
+            version=next_version,
+        )
+        if not any(not turn.confirmed and not turn.skipped for turn in project.clarification_turns):
+            project.status = ProjectStatus.AWAITING_PLAN_APPROVAL
+        if source.active_plan is not None:
+            plan = self._clone_plan(source.active_plan, version=1, brief=project.brief)
+            plan.resolved_settings = self.planner.resolve_settings(
+                project.brief,
+                default_parallelism=self._global_parallelism(),
+            )
+            for shot in plan.shots:
+                if shot.prompt_bundle is not None:
+                    shot.prompt_bundle.parameters = {**shot.prompt_bundle.parameters, **plan.resolved_settings}
+            project.plans = [plan]
+            project.status = ProjectStatus.AWAITING_PLAN_APPROVAL
+        self.store.save_project(project, event_type="project.version.created", payload={"source_project_id": source.id, "version": next_version, "actor": actor})
+        return project
+
+    def rewind(self, project: Project, target_phase: str, *, actor: str = "human", reason: str = "operator rewind") -> Project:
+        """Reopen a stable workflow phase without deleting audit history."""
+        if target_phase not in {"requirements", "plan", "generation", "review", "repair"}:
+            raise ValueError("target_phase must be requirements, plan, generation, review or repair")
+        if project.status in {ProjectStatus.GENERATING, ProjectStatus.JUDGING, ProjectStatus.REPAIRING, ProjectStatus.ASSEMBLING}:
+            raise HumanGate("Pause the running project before rewinding")
+        if target_phase == "requirements":
+            for turn in project.clarification_turns:
+                turn.confirmed = False
+                turn.answer = None
+                turn.skipped = False
+            for plan in project.plans:
+                plan.status = "obsolete"
+            self._invalidate_downstream(project, reason)
+            project.transition(ProjectStatus.CLARIFYING, force=True)
+        elif target_phase == "plan":
+            for plan in project.plans:
+                plan.status = "obsolete"
+            self._invalidate_downstream(project, reason)
+            project.transition(ProjectStatus.AWAITING_PLAN_APPROVAL, force=True)
+        elif target_phase == "generation":
+            self._invalidate_downstream(project, reason)
+            project.transition(ProjectStatus.PLANNED, force=True)
+        else:
+            project.transition(ProjectStatus.AWAITING_HUMAN, force=True)
+        self.store.save_project(project, event_type="project.rewound", payload={"target_phase": target_phase, "actor": actor, "reason": reason})
         return project
 
     def answer_clarifications(self, project: Project, answers: dict[str, str]) -> Project:
@@ -179,27 +302,10 @@ class DirectorOrchestrator:
         }
         if project.status not in rollback_states:
             raise HumanGate(f"Plan rollback is not allowed while project is {project.status.value}")
-        restored = deepcopy(source)
-        scene_ids = {scene.id: new_id("scene") for scene in restored.scenes}
-        shot_ids = {shot.id: new_id("shot") for shot in restored.shots}
-        for scene in restored.scenes:
-            scene.id = scene_ids[scene.id]
-            scene.shot_ids = [shot_ids.get(shot_id, shot_id) for shot_id in scene.shot_ids]
-        for shot in restored.shots:
-            old_id = shot.id
-            shot.id = shot_ids[old_id]
-            shot.scene_id = scene_ids.get(shot.scene_id, shot.scene_id)
-            shot.previous_shot_id = shot_ids.get(shot.previous_shot_id, shot.previous_shot_id)
-            shot.next_shot_id = shot_ids.get(shot.next_shot_id, shot.next_shot_id)
-            shot.depends_on_shot_ids = [shot_ids.get(dep, dep) for dep in shot.depends_on_shot_ids]
-            shot.acceptance_criteria = [replace(criterion, id=new_id("criterion")) for criterion in shot.acceptance_criteria]
-            if shot.prompt_bundle is not None:
-                shot.prompt_bundle = replace(shot.prompt_bundle, id=new_id("prompt"))
-        restored.audio_cues = [replace(cue, id=new_id("cue")) for cue in restored.audio_cues]
-        restored.version = max((candidate.version for candidate in project.plans), default=0) + 1
-        restored.id = new_id("plan")
-        restored.status = "draft"
-        restored.approved_by = None
+        restored = self._clone_plan(
+            source,
+            version=max((candidate.version for candidate in project.plans), default=0) + 1,
+        )
         project.plans.append(restored)
         project.transition(ProjectStatus.AWAITING_PLAN_APPROVAL, force=project.status == ProjectStatus.FAILED)
         self.store.save_project(project, event_type="plan.rolled_back", payload={"source_version": version, "plan_id": restored.id, "actor": actor})
