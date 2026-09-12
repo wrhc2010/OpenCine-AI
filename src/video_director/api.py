@@ -9,8 +9,10 @@ import base64
 import hashlib
 import json
 import os
+from pathlib import Path
 import secrets
 import time
+import urllib.request
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,15 +24,18 @@ except ImportError as error:  # pragma: no cover - exercised when API extras are
     raise RuntimeError("FastAPI is optional; install ai-video-director[api] to run the API") from error
 
 from . import __version__
-from .cli import build_mock_orchestrator, build_orchestrator
+from .artifacts import FFmpegAssembler, LocalArtifactStore
+from .cli import _build_llm, _build_vlm, _provider_keys, build_orchestrator
 from .execution import BudgetExceeded, HumanGate
 from .providers.http import (
+    AgnesVideoProvider,
     ComfyUIProvider,
     FalLikeAsyncVideoProvider,
     JSONHTTPClient,
+    RotatingJSONHTTPClient,
     TemplateHTTPVideoProvider,
 )
-from .providers.mock import MockVideoProvider
+from .providers.mock import MockAssembler, MockJudgeProvider, MockVideoProvider
 from .queue import make_job_queue
 from .scheduler import ProjectJobHandler, queue_project_run
 from .schemas import CreativeBrief, Project, ProjectStatus, as_jsonable, stable_hash
@@ -76,11 +81,7 @@ def _brief(payload: dict[str, Any]) -> CreativeBrief:
 
 app = FastAPI(title="AI Video Director", version=__version__)
 store_path = os.getenv("DIRECTOR_DATABASE_URL", "sqlite:///.data/api.db")
-try:
-    orchestrator = build_orchestrator(store_path=store_path, fail_first_attempts=1)
-except ValueError:
-    # A missing cloud URL should not prevent the local API from booting.
-    orchestrator = build_mock_orchestrator(store_path=store_path, fail_first_attempts=1)
+orchestrator = build_orchestrator(store_path=store_path, fail_first_attempts=1)
 queue = make_job_queue(os.getenv("DIRECTOR_QUEUE_URL") or (None if os.getenv("REDIS_URL") else ".data/api-queue.db"))
 job_handler = ProjectJobHandler(orchestrator)
 projects: dict[str, Project] = {}
@@ -88,6 +89,38 @@ projects: dict[str, Project] = {}
 
 def project_view(project: Project) -> dict[str, Any]:
     return as_jsonable(project)
+
+
+def _delivery_artifact(project_id: str, artifact_id: str) -> tuple[Project, Any]:
+    project = _get(project_id)
+    artifact = next((item for item in project.artifacts if item.id == artifact_id), None)
+    if artifact is None or artifact.kind.value != "video" or artifact.metadata.get("artifact_role") != "delivery" or artifact.metadata.get("active") is not True:
+        raise HTTPException(404, "active delivery artifact not found")
+    return project, artifact
+
+
+def _media_cache_path(project_id: str, artifact_id: str) -> Path:
+    root = Path(os.getenv("DIRECTOR_MEDIA_ROOT", ".data/media"))
+    path = (root / project_id / f"{artifact_id}.mp4").resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _read_delivery_bytes(project_id: str, artifact: Any) -> tuple[bytes, str]:
+    uri = str(artifact.uri)
+    cached = _media_cache_path(project_id, artifact.id)
+    if cached.is_file():
+        return cached.read_bytes(), "video/mp4"
+    source = Path(uri)
+    if source.is_file():
+        data = source.read_bytes()
+    elif uri.startswith(("http://", "https://")):
+        with urllib.request.urlopen(uri, timeout=120) as response:  # noqa: S310 - provider URL is stored by the configured adapter
+            data = response.read()
+    else:
+        raise HTTPException(404, "delivery media is not available locally")
+    cached.write_bytes(data)
+    return data, str(artifact.mime_type or "video/mp4")
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -127,7 +160,7 @@ def _masked_custom_providers() -> list[dict[str, Any]]:
 
 def _save_custom_providers(value: list[dict[str, Any]]) -> None:
     orchestrator.store.set_setting(CUSTOM_PROVIDER_SETTING_KEY, json.dumps(value, ensure_ascii=False))
-    _reload_custom_video_provider()
+    _reload_runtime_providers()
 
 
 def _reload_custom_video_provider() -> None:
@@ -173,6 +206,20 @@ def _reload_custom_video_provider() -> None:
                 model=orchestrator.store.get_setting("VIDEO_MODEL") or os.getenv("VIDEO_MODEL", "video-model"),
                 cost_per_second_usd=float(os.getenv("VIDEO_COST_PER_SECOND_USD", "0.25")),
             )
+    elif normalized in {"agnes", "agnes-video", "agnes-video-v2.0"}:
+        keys = _provider_keys(orchestrator.store)
+        if not keys:
+            raise ValueError("AGNES_API_KEY or OPENAI_API_KEY is required for Agnes Video")
+        provider = AgnesVideoProvider(
+            api_keys=keys,
+            client=RotatingJSONHTTPClient(
+                keys,
+                timeout_seconds=120,
+                interval_seconds=float(os.getenv("DIRECTOR_PROVIDER_INTERVAL_SECONDS", "60")),
+                cooldown_seconds=900,
+            ),
+            model=orchestrator.store.get_setting("VIDEO_MODEL") or os.getenv("VIDEO_MODEL", "agnes-video-v2.0"),
+        )
     elif normalized == "comfyui":
         provider = orchestrator.video_providers.get("comfyui") or ComfyUIProvider(os.getenv("COMFYUI_BASE_URL", "http://localhost:8188"))
     else:
@@ -181,6 +228,19 @@ def _reload_custom_video_provider() -> None:
         raise ValueError(f"Unsupported VIDEO_PROVIDER: {selected}")
     orchestrator.video_provider = provider
     orchestrator.video_providers[provider.name] = provider
+
+
+def _reload_runtime_providers() -> None:
+    """Apply current database settings to new clarification and judge calls."""
+    _reload_custom_video_provider()
+    if getattr(orchestrator.video_provider, "name", "") == MockVideoProvider.name:
+        orchestrator.assembler = MockAssembler()
+    else:
+        orchestrator.assembler = FFmpegAssembler(
+            artifact_store=LocalArtifactStore(os.getenv("DIRECTOR_MEDIA_ROOT", ".data/media"))
+        )
+    orchestrator.clarifier.llm_provider = _build_llm(orchestrator.store)
+    orchestrator.quality.judge = _build_vlm(orchestrator.store) or MockJudgeProvider()
 
 
 def _validate_custom_provider(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -226,17 +286,20 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "DIRECTOR_DEFAULT_ACCEPTANCE_MODE": "standard",
     "LLM_PROVIDER": "openai-compatible-llm",
     "VLM_PROVIDER": "openai-compatible-vlm-judge",
+    "OPENAI_BASE_URL": "",
 }
-SETTING_KEYS = set(SETTING_DEFAULTS) | {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
-SECRET_SETTING_KEYS = {"OPENAI_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
-CONNECTION_SETTING_KEYS = {"DIRECTOR_DATABASE_URL", "REDIS_URL", "OBJECT_STORAGE_ENDPOINT"}
+SETTING_KEYS = set(SETTING_DEFAULTS) | {"OPENAI_API_KEY", "AGNES_API_KEY", "AGNES_BACKUP_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
+SECRET_SETTING_KEYS = {"OPENAI_API_KEY", "AGNES_API_KEY", "AGNES_BACKUP_API_KEY", "FAL_API_KEY", "REPLICATE_API_TOKEN"}
+CONNECTION_SETTING_KEYS = {"DIRECTOR_DATABASE_URL", "REDIS_URL", "OBJECT_STORAGE_ENDPOINT", "OPENAI_BASE_URL"}
 SETTING_KEYS |= CONNECTION_SETTING_KEYS
 CUSTOM_PROVIDER_SETTING_KEY = "CUSTOM_PROVIDERS"
 RESTART_SETTING_KEYS = {
     "DIRECTOR_DATABASE_URL",
     "REDIS_URL",
     "OBJECT_STORAGE_ENDPOINT",
+    "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
+    "AGNES_API_KEY",
     "FAL_API_KEY",
     "REPLICATE_API_TOKEN",
 }
@@ -360,7 +423,7 @@ BASIC_SETTING_KEYS = {
     "LLM_PROVIDER", "VLM_PROVIDER", "DIRECTOR_PROJECT_BUDGET_USD", "DIRECTOR_PARALLELISM",
     "DIRECTOR_DEFAULT_DURATION_SECONDS", "DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS",
     "DIRECTOR_DEFAULT_MAX_SHOTS", "DIRECTOR_DEFAULT_ACCEPTANCE_MODE",
-    *SECRET_SETTING_KEYS,
+    *SECRET_SETTING_KEYS, "OPENAI_BASE_URL",
 }
 ADVANCED_SETTING_KEYS = SETTING_KEYS - BASIC_SETTING_KEYS
 
@@ -428,7 +491,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         elif not isinstance(value, (str, int, float, bool)):
             raise HTTPException(400, f"设置项必须是简单值：{key}")
         orchestrator.store.set_setting(key, str(value))
-    _reload_custom_video_provider()
+    _reload_runtime_providers()
     return get_settings()
 
 
@@ -782,6 +845,57 @@ def deliver_project(project_id: str, payload: dict[str, str] | None = None) -> d
         return project_view(orchestrator.deliver(project, actor=(payload or {}).get("actor", "human")))
     except (HumanGate, ValueError) as error:
         raise HTTPException(409, str(error)) from error
+
+
+@app.get("/v1/projects/{project_id}/artifacts/{artifact_id}/stream")
+def stream_delivery(project_id: str, artifact_id: str, request: Request):
+    """Serve the active delivery as a browser-playable, range-aware response."""
+    _, artifact = _delivery_artifact(project_id, artifact_id)
+    data, media_type = _read_delivery_bytes(project_id, artifact)
+    size = len(data)
+    range_header = request.headers.get("range")
+    start, end = 0, size - 1
+    status_code = 200
+    if range_header and range_header.startswith("bytes="):
+        raw_range = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+        raw_start, raw_end = (raw_range.split("-", 1) + [""])[:2]
+        try:
+            if raw_start:
+                start = int(raw_start)
+                end = int(raw_end) if raw_end else size - 1
+            elif raw_end:
+                length = int(raw_end)
+                start = max(0, size - length)
+            else:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        if start < 0 or start >= size or end < start:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        end = min(end, size - 1)
+        status_code = 206
+    body = data[start:end + 1]
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(len(body)),
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Cache-Control": "private, max-age=0",
+    }
+    if status_code == 200:
+        headers.pop("Content-Range", None)
+    return Response(content=body, status_code=status_code, media_type=media_type, headers=headers)
+
+
+@app.get("/v1/projects/{project_id}/artifacts/{artifact_id}/download")
+def download_delivery(project_id: str, artifact_id: str, request: Request):
+    """Serve the active delivery as an attachment."""
+    _, artifact = _delivery_artifact(project_id, artifact_id)
+    data, media_type = _read_delivery_bytes(project_id, artifact)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="opencine-{project_id}.mp4"', "Content-Length": str(len(data))},
+    )
 
 
 @app.post("/v1/projects/{project_id}/cancel")

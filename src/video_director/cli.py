@@ -6,9 +6,14 @@ import json
 import os
 
 from .execution import DirectorOrchestrator
+from .artifacts import FFmpegAssembler, LocalArtifactStore
 from .providers.http import (
+    AgnesVideoProvider,
     ComfyUIProvider,
     FalLikeAsyncVideoProvider,
+    OpenAICompatibleLLMProvider,
+    OpenAICompatibleVLMJudgeProvider,
+    RotatingJSONHTTPClient,
     TemplateHTTPVideoProvider,
 )
 from .providers.mock import (
@@ -51,6 +56,51 @@ def build_mock_orchestrator(
     )
 
 
+def _configured(store, key: str, *environment_names: str, default: str | None = None) -> str | None:
+    value = store.get_setting(key)
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    for name in environment_names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _build_llm(store):
+    provider_name = (_configured(store, "LLM_PROVIDER", "LLM_PROVIDER", default="openai-compatible-llm") or "").lower()
+    keys = _provider_keys(store)
+    api_key = keys[0] if keys else None
+    if not api_key or provider_name in {"mock", "none", "disabled"}:
+        return None
+    return OpenAICompatibleLLMProvider(
+        _configured(store, "OPENAI_BASE_URL", "OPENAI_BASE_URL", "DIRECTOR_LLM_BASE_URL", "AGNES_BASE_URL", default="https://api.openai.com/v1") or "https://api.openai.com/v1",
+        api_key=api_key,
+        client=RotatingJSONHTTPClient(keys, interval_seconds=float(os.getenv("DIRECTOR_PROVIDER_INTERVAL_SECONDS", "60"))) if keys else None,
+        model=_configured(store, "DIRECTOR_LLM_MODEL", "DIRECTOR_LLM_MODEL", default="gpt-4o-mini") or "gpt-4o-mini",
+    )
+
+
+def _build_vlm(store):
+    provider_name = (_configured(store, "VLM_PROVIDER", "VLM_PROVIDER", default="openai-compatible-vlm-judge") or "").lower()
+    keys = _provider_keys(store)
+    api_key = keys[0] if keys else None
+    if not api_key or provider_name in {"mock", "none", "disabled"}:
+        return None
+    return OpenAICompatibleVLMJudgeProvider(
+        _configured(store, "OPENAI_BASE_URL", "OPENAI_BASE_URL", "DIRECTOR_VLM_BASE_URL", "AGNES_BASE_URL", default="https://api.openai.com/v1") or "https://api.openai.com/v1",
+        api_key=api_key,
+        client=RotatingJSONHTTPClient(keys, interval_seconds=float(os.getenv("DIRECTOR_PROVIDER_INTERVAL_SECONDS", "60"))) if keys else None,
+        model=_configured(store, "DIRECTOR_VLM_MODEL", "DIRECTOR_VLM_MODEL", default="gpt-4o-mini") or "gpt-4o-mini",
+    )
+
+
+def _provider_keys(store) -> list[str]:
+    primary = _configured(store, "AGNES_API_KEY", "AGNES_API_KEY", "OPENAI_API_KEY") or _configured(store, "OPENAI_API_KEY", "OPENAI_API_KEY")
+    backup = _configured(store, "AGNES_BACKUP_API_KEY", "AGNES_BACKUP_API_KEY", "OPENAI_BACKUP_API_KEY")
+    return [key for key in (primary, backup) if key]
+
+
 def build_orchestrator(
     *,
     store_path: str | None = None,
@@ -64,12 +114,25 @@ def build_orchestrator(
         custom_providers = json.loads(configured_custom) if configured_custom else []
     except (TypeError, ValueError, json.JSONDecodeError):
         custom_providers = []
-    provider_name = os.getenv("VIDEO_PROVIDER") or store.get_setting("VIDEO_PROVIDER") or "mock"
-    provider_name = provider_name.strip().lower()
+    provider_name = (_configured(store, "VIDEO_PROVIDER", "VIDEO_PROVIDER", default="mock") or "mock").strip().lower()
     if provider_name == "mock":
         video_provider = MockVideoProvider(
             fail_first_attempts=fail_first_attempts,
             cost_usd=float(os.getenv("MOCK_VIDEO_COST_USD", "1.25")),
+        )
+    elif provider_name in {"agnes", "agnes-video", "agnes-video-v2.0"}:
+        keys = _provider_keys(store)
+        if not keys:
+            raise ValueError("AGNES_API_KEY or OPENAI_API_KEY is required for Agnes Video")
+        video_provider = AgnesVideoProvider(
+            api_keys=keys,
+            client=RotatingJSONHTTPClient(
+                keys,
+                timeout_seconds=120,
+                interval_seconds=float(os.getenv("DIRECTOR_PROVIDER_INTERVAL_SECONDS", "60")),
+                cooldown_seconds=900,
+            ),
+            model=_configured(store, "VIDEO_MODEL", "VIDEO_MODEL", default="agnes-video-v2.0") or "agnes-video-v2.0",
         )
     elif provider_name in {"fal", "fal-like", "replicate"}:
         base_url = os.getenv("FAL_BASE_URL") or os.getenv("REPLICATE_BASE_URL")
@@ -91,11 +154,15 @@ def build_orchestrator(
         video_provider = TemplateHTTPVideoProvider(config)
     else:
         raise ValueError(f"Unsupported VIDEO_PROVIDER: {provider_name}")
+    llm_provider = _build_llm(store)
+    vlm_provider = _build_vlm(store)
+    assembler = MockAssembler() if provider_name == "mock" else FFmpegAssembler(artifact_store=LocalArtifactStore(os.getenv("DIRECTOR_MEDIA_ROOT", ".data/media")))
     return DirectorOrchestrator(
         video_provider=video_provider,
-        judge_provider=MockJudgeProvider(),
-        assembler=MockAssembler(),
+        judge_provider=vlm_provider or MockJudgeProvider(),
+        assembler=assembler,
         audio_provider=MockAudioProvider(),
+        llm_provider=llm_provider,
         store=store,
         max_attempts=int(os.getenv("DIRECTOR_MAX_ATTEMPTS", "3")),
         parallelism=_parallelism_from_env() if parallelism is None else parallelism,
@@ -146,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--max-jobs", type=int, default=None)
     worker.add_argument("--idle-cycles", type=int, default=3)
+    worker.add_argument("--forever", action="store_true", help="keep polling until the process is stopped")
     args = parser.parse_args(argv)
     if args.command == "demo":
         run_demo(args.shots, json_output=args.json_output)
@@ -153,8 +221,19 @@ def main(argv: list[str] | None = None) -> None:
         configured_store = os.getenv("DIRECTOR_DATABASE_URL", "sqlite:///.data/director.db")
         orchestrator = build_orchestrator(store_path=configured_store, fail_first_attempts=0)
         queue = make_job_queue(os.getenv("DIRECTOR_QUEUE_URL") or (None if os.getenv("REDIS_URL") else ".data/api-queue.db"))
-        worker = DirectorWorker(queue, ProjectJobHandler(orchestrator), lease_seconds=float(os.getenv("DIRECTOR_WORKER_LEASE_SECONDS", "120")))
-        processed = worker.run(max_jobs=1 if args.once else args.max_jobs, idle_cycles=1 if args.once else args.idle_cycles)
+        handler = ProjectJobHandler(orchestrator)
+
+        def refresh_worker_runtime() -> None:
+            nonlocal orchestrator
+            previous = orchestrator
+            orchestrator = build_orchestrator(store_path=configured_store, fail_first_attempts=0)
+            handler.orchestrator = orchestrator
+            previous.store.close()
+
+        handler.before_execute = refresh_worker_runtime
+        worker = DirectorWorker(queue, handler, lease_seconds=float(os.getenv("DIRECTOR_WORKER_LEASE_SECONDS", "120")))
+        idle_cycles = None if args.forever else (1 if args.once else args.idle_cycles)
+        processed = worker.run(max_jobs=1 if args.once else args.max_jobs, idle_cycles=idle_cycles)
         print(f"video-director worker processed {processed} job(s)")
 
 

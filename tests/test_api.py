@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from video_director.artifacts import FFmpegAssembler
 from video_director.api import app, queue
 from video_director.cli import build_mock_orchestrator
+from video_director.schemas import ArtifactRef, AssetKind, ProjectStatus
 from video_director.store import SnapshotConflict
 
 
@@ -290,8 +292,48 @@ def test_api_project_lineage_rewind_settings_and_custom_provider(monkeypatch, tm
     assert updated.status_code == 200 and updated.json()["api_key"] == "********"
     assert client.patch("/v1/settings/basic", json={"VIDEO_PROVIDER": "custom:workflow-provider"}).status_code == 200
     assert replacement.video_provider.name == "workflow-provider"
+    assert isinstance(replacement.assembler, FFmpegAssembler)
     assert client.patch("/v1/settings/basic", json={"VIDEO_PROVIDER": "mock"}).status_code == 200
     assert replacement.video_provider.name == "mock-video"
+    assert replacement.assembler.name == "mock-assembler"
     assert client.delete("/v1/providers/custom/workflow-provider").json()["deleted"] is True
 
+    replacement.store.close()
+
+
+def test_api_delivery_stream_supports_range_and_download(monkeypatch, tmp_path):
+    replacement = build_mock_orchestrator(store_path=tmp_path / "media-api.db", fail_first_attempts=0)
+    monkeypatch.setattr("video_director.api.orchestrator", replacement)
+    monkeypatch.setattr("video_director.api.projects", {})
+    monkeypatch.setenv("DIRECTOR_MEDIA_ROOT", str(tmp_path / "media"))
+    client = TestClient(app)
+
+    project = client.post(
+        "/v1/projects",
+        json={"title": "Media fixture", "request": "A short delivery.", "duration_seconds": 3, "shot_duration_seconds": 3, "max_shots": 1, "budget_usd": 10},
+    ).json()
+    stored = replacement.store.load_project(project["id"])
+    assert stored is not None
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"0123456789")
+    stored.artifacts.append(
+        ArtifactRef(
+            AssetKind.VIDEO,
+            str(source),
+            mime_type="video/mp4",
+            metadata={"artifact_role": "delivery", "active": True},
+        )
+    )
+    stored.transition(ProjectStatus.AWAITING_HUMAN, force=True)
+    replacement.store.save_project(stored, event_type="fixture.media")
+    artifact_id = stored.artifacts[-1].id
+
+    ranged = client.get(f"/v1/projects/{stored.id}/artifacts/{artifact_id}/stream", headers={"Range": "bytes=2-5"})
+    assert ranged.status_code == 206
+    assert ranged.content == b"2345"
+    assert ranged.headers["content-range"] == "bytes 2-5/10"
+    downloaded = client.get(f"/v1/projects/{stored.id}/artifacts/{artifact_id}/download")
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"0123456789"
+    assert "attachment" in downloaded.headers["content-disposition"]
     replacement.store.close()

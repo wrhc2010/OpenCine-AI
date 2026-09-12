@@ -1,8 +1,24 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import os
+from pathlib import Path
 
-from video_director.queue import DirectorWorker, RedisStreamJobQueue, SQLiteJobQueue
+from video_director.queue import DirectorWorker, RedisStreamJobQueue, SQLiteJobQueue, make_job_queue
+
+
+def test_sqlite_absolute_uri_keeps_container_mount_path(tmp_path):
+    queue_path = tmp_path / "jobs.db"
+    queue = make_job_queue(f"sqlite:////{queue_path.as_posix().lstrip('/')}")
+    expected_path = queue_path.as_posix() if os.name == "nt" else f"/{queue_path.as_posix().lstrip('/')}"
+    assert queue.path == expected_path
+    assert queue.connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
+    queue.close()
+
+
+def test_docker_queue_uri_targets_the_backend_data_volume():
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "DIRECTOR_QUEUE_URL: sqlite:////app/.data/director-queue.db" in compose
 
 
 def test_queue_idempotency_and_lease_recovery(tmp_path):

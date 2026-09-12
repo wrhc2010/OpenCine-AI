@@ -8,6 +8,7 @@ snapshot.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from .execution import BudgetExceeded, DirectorOrchestrator, HumanGate
@@ -25,11 +26,14 @@ class ProjectJobResult:
 class ProjectJobHandler:
     """Execute queue commands against an orchestrator and persisted project."""
 
-    def __init__(self, orchestrator: DirectorOrchestrator, *, snapshot_retries: int = 3) -> None:
+    def __init__(self, orchestrator: DirectorOrchestrator, *, snapshot_retries: int = 3, before_execute: Callable[[], None] | None = None) -> None:
         self.orchestrator = orchestrator
         self.snapshot_retries = max(0, int(snapshot_retries))
+        self.before_execute = before_execute
 
     def __call__(self, job: Job) -> dict[str, Any]:
+        if self.before_execute is not None:
+            self.before_execute()
         payload = job.payload
         command = job.kind
         for conflict_attempt in range(self.snapshot_retries + 1):

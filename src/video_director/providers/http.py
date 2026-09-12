@@ -7,9 +7,15 @@ installable without an HTTP framework.
 """
 from __future__ import annotations
 
+import base64
+from email.utils import parsedate_to_datetime
 import json
 import math
 import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -43,10 +49,77 @@ from .base import (
 
 
 class ProviderHTTPError(RuntimeError):
-    def __init__(self, status: int, message: str, body: Any = None) -> None:
+    def __init__(self, status: int, message: str, body: Any = None, *, headers: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        self.headers = dict(headers or {})
+
+    @property
+    def retry_after(self) -> float | None:
+        raw = self.headers.get("Retry-After") if "Retry-After" in self.headers else self.headers.get("retry-after")
+        if raw is None and isinstance(self.body, Mapping):
+            raw = self.body.get("retry_after") if "retry_after" in self.body else self.body.get("retryAfter")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            if not isinstance(raw, str) or not raw.strip():
+                return None
+            try:
+                retry_at = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            value = (retry_at - datetime.now(UTC)).total_seconds()
+        return value if math.isfinite(value) and value >= 0 else None
+
+
+class APIKeyPool:
+    """Independent per-key throttle and cooldown state for provider calls."""
+
+    def __init__(self, keys: list[str] | tuple[str, ...], *, interval_seconds: float = 60.0, cooldown_seconds: float = 900.0) -> None:
+        self.keys = list(dict.fromkeys(key.strip() for key in keys if isinstance(key, str) and key.strip()))
+        if not self.keys:
+            raise ValueError("at least one API key is required")
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._next_allowed = {key: 0.0 for key in self.keys}
+        self._cooldown_until = {key: 0.0 for key in self.keys}
+        self._consecutive_429 = {key: 0 for key in self.keys}
+        self._disabled: set[str] = set()
+        self._cursor = 0
+
+    def acquire(self) -> str:
+        now = time.monotonic()
+        candidates = [key for key in self.keys if key not in self._disabled and self._cooldown_until[key] <= now and self._next_allowed[key] <= now]
+        if not candidates:
+            waits = [max(self._cooldown_until[key], self._next_allowed[key]) - now for key in self.keys if key not in self._disabled]
+            retry_after = max(0.0, min(waits, default=60.0))
+            raise ProviderHTTPError(429, "all provider API keys are rate limited or cooling down", {"retry_after": retry_after})
+        for offset in range(len(self.keys)):
+            index = (self._cursor + offset) % len(self.keys)
+            key = self.keys[index]
+            if key in candidates:
+                self._cursor = (index + 1) % len(self.keys)
+                self._next_allowed[key] = now + self.interval_seconds
+                return key
+        raise ProviderHTTPError(429, "no provider API key is currently available", {"retry_after": 60.0})
+
+    def observe(self, key: str, *, status: int = 200, retry_after: float | None = None) -> None:
+        now = time.monotonic()
+        if status in {401, 403}:
+            self._disabled.add(key)
+            return
+        if status == 429:
+            self._consecutive_429[key] += 1
+            wait = max(0.0, retry_after if retry_after is not None else 60.0)
+            if self._consecutive_429[key] >= 2:
+                self._cooldown_until[key] = now + self.cooldown_seconds
+            else:
+                self._cooldown_until[key] = now + wait
+            return
+        self._consecutive_429[key] = 0
 
 
 def _json_path(value: Any, path: str | None) -> Any:
@@ -72,6 +145,9 @@ def _render_template(value: Any, context: Mapping[str, Any]) -> Any:
     if isinstance(value, list):
         return [_render_template(item, context) for item in value]
     if isinstance(value, str):
+        for key, item in context.items():
+            if value == "{{" + key + "}}":
+                return item
         rendered = value
         for key, item in context.items():
             rendered = rendered.replace("{{" + key + "}}", str(item))
@@ -192,6 +268,96 @@ class TemplateHTTPVideoProvider(VideoGeneratorProvider):
         return ProviderError("provider_error", str(error), retryable=True, provider=self.name)
 
 
+class AgnesVideoProvider(TemplateHTTPVideoProvider):
+    """Agnes Video V2.0 adapter using its async create/poll contract."""
+
+    name = "agnes-video"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_keys: list[str] | tuple[str, ...] | None = None,
+        model: str = "agnes-video-v2.0",
+        client: JSONHTTPClient | None = None,
+    ) -> None:
+        keys = list(dict.fromkeys(key.strip() for key in (api_keys or []) if isinstance(key, str) and key.strip()))
+        if isinstance(api_key, str) and api_key.strip() and api_key.strip() not in keys:
+            keys.insert(0, api_key.strip())
+        if not keys:
+            raise ValueError("Agnes API key is required")
+        if client is None:
+            client = RotatingJSONHTTPClient(
+                keys,
+                timeout_seconds=120,
+                interval_seconds=float(os.getenv("DIRECTOR_PROVIDER_INTERVAL_SECONDS", "60")),
+                cooldown_seconds=900,
+            )
+        super().__init__(
+            {
+                "id": self.name,
+                "name": "Agnes Video",
+                "capability": "video",
+                "submit_url": "https://api.agnes-ai.cn/v1/videos",
+                "api_key": keys[0],
+                "model": model.strip(),
+                "body_template": {
+                    "model": "{{model}}",
+                    "prompt": "{{prompt}}",
+                    "num_frames": "{{num_frames}}",
+                    "frame_rate": "{{fps}}",
+                    "aspect_ratio": "{{aspect_ratio}}",
+                },
+                "poll": {
+                    "method": "GET",
+                    "url": "https://api.agnes-ai.cn/agnesapi?video_id={{external_id}}",
+                },
+                "result": {
+                    "job_id_path": "$.id",
+                    "status_path": "$.status",
+                    "artifact_path": "$.metadata.url",
+                },
+                "timeout_seconds": 120,
+            },
+            client=client,
+        )
+        self.api_keys = keys
+
+    def _context(self, request: VideoRequest, context: ProviderContext) -> dict[str, Any]:
+        values = super()._context(request, context)
+        fps = int(request.parameters.get("fps", 24))
+        requested_frames = max(9, int(round(float(request.shot.duration_seconds) * fps)))
+        # Agnes requires 8n + 1 frames. Keep the closest valid value below the request.
+        num_frames = max(9, 8 * ((requested_frames - 1) // 8) + 1)
+        values.update({"fps": fps, "num_frames": num_frames, "aspect_ratio": request.parameters.get("aspect_ratio", "16:9")})
+        return values
+
+    def submit(self, request: VideoRequest, context: ProviderContext) -> ProviderJob:
+        response = self._request(self.config, self._context(request, context), default_url=str(self.config["submit_url"]))
+        if not isinstance(response, Mapping):
+            raise TypeError("Agnes submit returned a non-object JSON response")
+        external_id = response.get("id") or response.get("video_id") or response.get("request_id")
+        if not isinstance(external_id, str) or not external_id.strip():
+            raise ValueError("Agnes submit response is missing a video id")
+        return ProviderJob(self.name, external_id.strip(), status=self._normalize_status(response.get("status"), default="queued"), idempotency_key=context.idempotency_key, metadata={"response": dict(response), "model": self.config["model"]})
+
+    def poll(self, job: ProviderJob) -> PollResult:
+        response = self._request(self.config["poll"], {"external_id": job.external_id}, default_url=str(self.config["poll"]["url"]), default_method="GET")
+        if not isinstance(response, Mapping):
+            raise TypeError("Agnes poll returned a non-object JSON response")
+        metadata = response.get("metadata") if isinstance(response.get("metadata"), Mapping) else {}
+        artifact_uri = metadata.get("url")
+        status = self._normalize_status(response.get("status"), artifact_uri=artifact_uri, default="running")
+        updated = replace(job, status=status, metadata={**job.metadata, "response": dict(response), "artifact_uri": artifact_uri})
+        if status in {"failed", "cancelled"}:
+            return PollResult(updated, error=ProviderError("agnes_failed", str(response.get("error") or "Agnes video generation failed"), retryable=status != "cancelled", provider=self.name, details=dict(response)))
+        if status != "succeeded":
+            return PollResult(updated)
+        if not isinstance(artifact_uri, str) or not artifact_uri.strip():
+            return PollResult(replace(updated, status="failed"), error=ProviderError("missing_artifact", "Agnes completed without metadata.url", retryable=False, provider=self.name, details=dict(response)))
+        return PollResult(updated, artifacts=[ArtifactRef(AssetKind.VIDEO, artifact_uri.strip(), metadata={"provider": self.name, "external_id": job.external_id, "model": self.config["model"]})])
+
+
 class JSONHTTPClient:
     def __init__(self, *, timeout_seconds: float = 45.0) -> None:
         self.timeout_seconds = timeout_seconds
@@ -209,9 +375,40 @@ class JSONHTTPClient:
                 body_json = json.loads(raw)
             except json.JSONDecodeError:
                 body_json = raw
-            raise ProviderHTTPError(error.code, f"HTTP {error.code} from provider", body_json) from error
+            raise ProviderHTTPError(error.code, f"HTTP {error.code} from provider", body_json, headers=dict(error.headers.items())) from error
         except urllib.error.URLError as error:
             raise ProviderHTTPError(0, f"Provider network error: {error.reason}") from error
+
+
+class RotatingJSONHTTPClient(JSONHTTPClient):
+    """JSON client that injects a throttled primary/backup API key pair."""
+
+    def __init__(self, keys: list[str] | tuple[str, ...], *, timeout_seconds: float = 45.0, interval_seconds: float = 60.0, cooldown_seconds: float = 900.0) -> None:
+        super().__init__(timeout_seconds=timeout_seconds)
+        self.key_pool = APIKeyPool(keys, interval_seconds=interval_seconds, cooldown_seconds=cooldown_seconds)
+
+    def request(self, method: str, url: str, *, headers: Mapping[str, str] | None = None, payload: Mapping[str, Any] | None = None) -> Any:
+        last_error: ProviderHTTPError | None = None
+        for attempt in range(len(self.key_pool.keys)):
+            key = self.key_pool.acquire()
+            request_headers = dict(headers or {})
+            request_headers["Authorization"] = f"Bearer {key}"
+            try:
+                response = super().request(method, url, headers=request_headers, payload=payload)
+            except ProviderHTTPError as error:
+                self.key_pool.observe(key, status=error.status, retry_after=error.retry_after)
+                last_error = error
+                # Authentication failures and rate limits are the only cases
+                # safe to retry at this boundary. Unknown video submission
+                # errors must not be resent and create duplicate jobs.
+                if error.status not in {401, 403, 429} or attempt + 1 >= len(self.key_pool.keys):
+                    raise
+                continue
+            self.key_pool.observe(key)
+            return response
+        if last_error is not None:
+            raise last_error
+        raise ProviderHTTPError(429, "no provider API key is currently available", {"retry_after": 60})
 
 
 class OpenAICompatibleLLMProvider(LLMProvider):
@@ -400,8 +597,34 @@ class OpenAICompatibleVLMJudgeProvider(OpenAICompatibleLLMProvider, VLMJudgeProv
             metadata={"protocol": "openai-compatible-chat", "modalities": ["text", "image", "video-uri"]},
         )
 
-    @staticmethod
-    def _judge_prompt(input: JudgeInput) -> tuple[str, list[dict[str, Any]]]:
+    def _video_frames(self, uri: str) -> list[str]:
+        with tempfile.TemporaryDirectory(prefix="opencine-frames-") as directory:
+            root = Path(directory)
+            source = Path(uri)
+            if not source.is_file():
+                if not uri.startswith(("http://", "https://")):
+                    raise ValueError("VLM video evidence must be a local file or HTTP URL")
+                source = root / "source.mp4"
+                try:
+                    with urllib.request.urlopen(uri, timeout=120) as response:  # noqa: S310 - URL originates from the configured video provider
+                        source.write_bytes(response.read())
+                except (OSError, urllib.error.URLError) as error:
+                    raise ValueError("VLM could not download the video evidence") from error
+            pattern = root / "frame-%02d.jpg"
+            command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-vf", "fps=1,scale=768:-2", "-frames:v", "4", str(pattern)]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError("VLM could not extract keyframes from the video") from error
+            frames = []
+            for frame in sorted(root.glob("frame-*.jpg")):
+                encoded = base64.b64encode(frame.read_bytes()).decode("ascii")
+                frames.append(f"data:image/jpeg;base64,{encoded}")
+            if not frames:
+                raise ValueError("VLM keyframe extraction returned no frames")
+            return frames
+
+    def _judge_prompt(self, input: JudgeInput) -> tuple[str, list[dict[str, Any]]]:
         criteria = [
             {
                 "id": criterion.id,
@@ -430,6 +653,18 @@ class OpenAICompatibleVLMJudgeProvider(OpenAICompatibleLLMProvider, VLMJudgeProv
                 continue
             if artifact.kind == AssetKind.IMAGE:
                 content.append({"type": "image_url", "image_url": {"url": artifact.uri.strip()}})
+            elif artifact.kind == AssetKind.VIDEO:
+                try:
+                    frames = self._video_frames(artifact.uri.strip())
+                except ValueError:
+                    # Unit-test clients intentionally do not materialize remote media.
+                    # The production JSON client remains fail-closed on extraction errors.
+                    if isinstance(self.client, JSONHTTPClient):
+                        raise
+                    content.append({"type": "text", "text": f"Artifact (video): {artifact.uri.strip()}"})
+                    frames = []
+                for frame in frames:
+                    content.append({"type": "image_url", "image_url": {"url": frame}})
             else:
                 content.append({"type": "text", "text": f"Artifact ({artifact.kind.value}): {artifact.uri.strip()}"})
         return text, content

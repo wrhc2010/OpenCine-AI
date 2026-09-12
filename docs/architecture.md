@@ -92,13 +92,14 @@ represented by `ArtifactRef`;
 
 ## Deployment
 
-Docker Compose runs API, worker, PostgreSQL, Redis and MinIO. For local work,
-SQLite plus the mock provider keeps the full loop deterministic and free.
-Production deployments should use Postgres, Redis Streams, S3-compatible object
-storage and a process supervisor for API/worker health and restart.
+Docker Compose runs three services: Nginx/React, FastAPI with its embedded
+SQLite queue and worker, and PostgreSQL. Queue state and downloaded media live
+in the backend volume; project snapshots and events live in PostgreSQL. Redis,
+MinIO and a separate worker container are not required by the default
+deployment.
 
-The Compose file supplies the infrastructure endpoints and passes
-DIRECTOR_PARALLELISM to both API and worker. It does not provision model
-credentials, configure a VLM judge, or create a MinIO bucket policy; those are
-deployment concerns. The local API falls back to the Mock provider when a
-cloud URL is not configured so health checks remain useful on a clean checkout.
+The Compose file passes model settings and credentials to the backend, but it
+does not provision them. The WebUI stores ordinary runtime settings in the
+database, and the worker reloads them before each new task or retry. The Mock
+Provider is useful for deterministic state-flow tests; real preview/download
+verification requires a Provider that returns playable media.

@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -12,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from .continuity import ContinuityGuardian
+from .artifacts import LocalArtifactStore, FFmpegAssembler
 from .dependencies import DependencyError, ready_shots
 from .planning import ClarificationAgent, PlanAgent
 from .providers.base import (
@@ -67,6 +71,7 @@ class DirectorOrchestrator:
         assembler: AssemblerProvider,
         audio_provider: AudioProvider | None = None,
         lip_sync_provider: LipSyncProvider | None = None,
+        llm_provider=None,
         store: EventStore | None = None,
         max_attempts: int = 3,
         max_poll_cycles: int = 8,
@@ -87,7 +92,7 @@ class DirectorOrchestrator:
             raise ValueError("parallelism must be a positive integer")
         self.parallelism = parallelism
         self._parallel_merge_lock = threading.RLock()
-        self.clarifier = ClarificationAgent()
+        self.clarifier = ClarificationAgent(llm_provider)
         self.planner = PlanAgent()
         self.continuity = ContinuityGuardian()
         self.max_attempts = max_attempts
@@ -245,6 +250,9 @@ class DirectorOrchestrator:
     def answer_clarifications(self, project: Project, answers: dict[str, str]) -> Project:
         project.clarification_turns = self.clarifier.apply_answers(project.clarification_turns, answers)
         unresolved = self.clarifier.unresolved(project.clarification_turns)
+        if not unresolved and self.clarifier.llm_provider is not None:
+            project.clarification_turns.extend(self.clarifier.inspect(project.brief, project.clarification_turns))
+            unresolved = self.clarifier.unresolved(project.clarification_turns)
         project.transition(ProjectStatus.CLARIFYING if unresolved else ProjectStatus.AWAITING_PLAN_APPROVAL)
         self.store.save_project(project, event_type="clarification.answered", payload={"remaining": len(unresolved)})
         return project
@@ -1096,6 +1104,7 @@ class DirectorOrchestrator:
             try:
                 artifacts = result.artifacts or provider.fetch_artifacts(job)
                 artifacts = self._validate_artifacts(artifacts, provider_name=getattr(provider, "name", None))
+                artifacts = self._materialize_artifacts(project.id, artifacts)
             except Exception as error:
                 if type(error) is RuntimeError:
                     raise
@@ -1202,6 +1211,7 @@ class DirectorOrchestrator:
             try:
                 artifacts = result.artifacts or provider.fetch_artifacts(attempt.provider_job)
                 artifacts = self._validate_artifacts(artifacts, provider_name=getattr(provider, "name", None))
+                artifacts = self._materialize_artifacts(project.id, artifacts)
             except Exception as error:
                 if type(error) is RuntimeError:
                     raise
@@ -1295,6 +1305,33 @@ class DirectorOrchestrator:
         elif attempt.status == "passed":
             return artifacts
         return None
+
+    def _materialize_artifacts(self, project_id: str, artifacts: list[ArtifactRef]) -> list[ArtifactRef]:
+        """Download remote video artifacts before FFmpeg or frame extraction uses them."""
+        if getattr(self.assembler, "name", "") != FFmpegAssembler.name:
+            return artifacts
+        root = LocalArtifactStore(os.getenv("DIRECTOR_MEDIA_ROOT", ".data/media"))
+        materialized: list[ArtifactRef] = []
+        for artifact in artifacts:
+            uri = artifact.uri.strip() if isinstance(artifact.uri, str) else ""
+            if artifact.kind != AssetKind.VIDEO or not uri.startswith(("http://", "https://")):
+                materialized.append(artifact)
+                continue
+            try:
+                with urllib.request.urlopen(uri, timeout=180) as response:  # noqa: S310 - URL is returned by the configured provider
+                    local = root.put_bytes(response.read(), kind=AssetKind.VIDEO, mime_type=artifact.mime_type or "video/mp4", metadata={"project_id": project_id, "source_uri": uri})
+            except (OSError, urllib.error.URLError) as error:
+                raise ValueError("video provider artifact could not be downloaded") from error
+            materialized.append(
+                replace(
+                    artifact,
+                    uri=local.uri,
+                    sha256=local.sha256,
+                    mime_type=local.mime_type or artifact.mime_type or "video/mp4",
+                    metadata={**artifact.metadata, "source_uri": uri, "materialized": True},
+                )
+            )
+        return materialized
 
     def _provider_for_prompt(self, prompt) -> VideoGeneratorProvider:
         name = prompt.provider if prompt is not None else None

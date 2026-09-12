@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import pytest
 
+from video_director import cli
 from video_director.artifacts import LocalArtifactStore
 from video_director.providers.base import (
     AudioRequest,
@@ -13,11 +15,14 @@ from video_director.providers.base import (
     VideoRequest,
 )
 from video_director.providers.http import (
+    AgnesVideoProvider,
     ComfyUIProvider,
     FalLikeAsyncVideoProvider,
+    JSONHTTPClient,
     OpenAICompatibleLLMProvider,
     OpenAICompatibleVLMJudgeProvider,
     ProviderHTTPError,
+    RotatingJSONHTTPClient,
     TemplateHTTPVideoProvider,
 )
 from video_director.schemas import (
@@ -28,6 +33,7 @@ from video_director.schemas import (
     Shot,
     Verdict,
 )
+from video_director.store import make_event_store
 
 
 @dataclass
@@ -238,6 +244,84 @@ def test_template_http_provider_normalizes_terminal_submit_status_and_artifact()
     assert job.status == "succeeded"
     assert provider.poll(job).artifacts[0].uri == "mock://done.mp4"
     assert client.calls[0][1] == "https://provider.test/submit"
+
+
+def test_template_http_provider_preserves_exact_template_value_types():
+    client = FakeHTTPClient([{"id": "job-1", "status": "queued"}])
+    provider = TemplateHTTPVideoProvider(
+        {
+            "id": "typed-provider",
+            "name": "Typed Provider",
+            "submit_url": "https://provider.test/submit",
+            "body_template": {"parameters": "{{parameters}}"},
+            "result": {"job_id_path": "$.id"},
+        },
+        client=client,
+    )
+    request_value = request()
+    request_value.parameters["fps"] = 24
+    provider.submit(request_value, ProviderContext("project", "shot", "idem-typed"))
+    assert client.calls[0][2]["parameters"] == request_value.parameters
+
+
+def test_agnes_video_rotates_to_backup_key_after_rate_limit(monkeypatch):
+    responses = [
+        ProviderHTTPError(429, "rate limited", {"retry_after": 0}),
+        {"id": "agnes-job", "status": "queued"},
+    ]
+    headers_seen: list[str] = []
+
+    def fake_request(self, method, url, *, headers=None, payload=None):
+        headers_seen.append(str((headers or {}).get("Authorization")))
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(JSONHTTPClient, "request", fake_request)
+    client = RotatingJSONHTTPClient(["primary", "backup"], interval_seconds=0, cooldown_seconds=900)
+    provider = AgnesVideoProvider(api_keys=["primary", "backup"], client=client)
+
+    job = provider.submit(request(), ProviderContext("project", "shot", "idem-agnes"))
+
+    assert job.external_id == "agnes-job"
+    assert headers_seen == ["Bearer primary", "Bearer backup"]
+    assert client.key_pool._cooldown_until["primary"] <= time.monotonic()
+
+
+def test_agnes_video_builds_rotating_client_when_multiple_keys_are_given():
+    provider = AgnesVideoProvider(api_keys=["primary", "backup"])
+    assert isinstance(provider.client, RotatingJSONHTTPClient)
+    assert provider.client.key_pool.keys == ["primary", "backup"]
+
+
+def test_build_orchestrator_wires_agnes_primary_and_backup_keys(tmp_path):
+    store_path = tmp_path / "agnes.db"
+    store = make_event_store(store_path)
+    store.set_setting("VIDEO_PROVIDER", "agnes")
+    store.set_setting("AGNES_API_KEY", "primary")
+    store.set_setting("AGNES_BACKUP_API_KEY", "backup")
+    store.close()
+
+    orchestrator = cli.build_orchestrator(store_path=store_path, parallelism=1)
+    provider = orchestrator.video_provider
+
+    assert isinstance(provider, AgnesVideoProvider)
+    assert isinstance(provider.client, RotatingJSONHTTPClient)
+    assert provider.client.key_pool.keys == ["primary", "backup"]
+
+
+def test_build_orchestrator_prefers_database_provider_settings(tmp_path, monkeypatch):
+    store_path = tmp_path / "provider-precedence.db"
+    store = make_event_store(store_path)
+    store.set_setting("VIDEO_PROVIDER", "mock")
+    store.close()
+    monkeypatch.setenv("VIDEO_PROVIDER", "agnes")
+
+    orchestrator = cli.build_orchestrator(store_path=store_path, parallelism=1)
+
+    assert orchestrator.video_provider.name == "mock-video"
+    orchestrator.store.close()
 
 
 @pytest.mark.parametrize(

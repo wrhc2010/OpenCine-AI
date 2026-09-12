@@ -1,10 +1,13 @@
 """Clarification and planning agents for the Creative IR."""
 from __future__ import annotations
 
+import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
+
+from .providers.base import LLMProvider
 
 from .schemas import (
     AcceptanceCriterion,
@@ -29,6 +32,9 @@ from .schemas import (
 class ClarificationAgent:
     """Find high-impact missing facts before a plan is allowed to run."""
 
+    def __init__(self, llm_provider: LLMProvider | None = None) -> None:
+        self.llm_provider = llm_provider
+
     QUESTIONS = (
         ("characters", "Who are the main characters, and what must remain consistent about them?"),
         ("setting", "Where and when does the story take place, including the key visual mood?"),
@@ -43,7 +49,9 @@ class ClarificationAgent:
         ("audio", "需要使用什么语言？对白、旁白、音乐氛围和字幕有哪些要求？"),
     )
 
-    def inspect(self, brief: CreativeBrief) -> list[ClarificationTurn]:
+    def inspect(self, brief: CreativeBrief, previous: Iterable[ClarificationTurn] = ()) -> list[ClarificationTurn]:
+        if self.llm_provider is not None:
+            return self._inspect_with_llm(brief, previous)
         text = brief.request.lower()
         turns: list[ClarificationTurn] = []
         questions = self.QUESTIONS_ZH if brief.language.lower().startswith("zh") else self.QUESTIONS
@@ -56,6 +64,89 @@ class ClarificationAgent:
             }[key]
             if not any(marker in text for marker in markers):
                 turns.append(ClarificationTurn(question=question, required=True, options=self._options(key, chinese=questions is self.QUESTIONS_ZH)))
+        return turns
+
+    def _inspect_with_llm(self, brief: CreativeBrief, previous: Iterable[ClarificationTurn]) -> list[ClarificationTurn]:
+        history = [
+            {"question": turn.question, "answer": turn.answer, "skipped": turn.skipped}
+            for turn in previous
+            if turn.confirmed or turn.answer
+        ]
+        schema = {
+            "type": "object",
+            "required": ["needs_clarification", "questions"],
+            "properties": {
+                "needs_clarification": {"type": "boolean"},
+                "questions": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "required": ["question", "required", "options"],
+                        "properties": {
+                            "question": {"type": "string"},
+                            "required": {"type": "boolean"},
+                            "options": {
+                                "type": "array",
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["label", "value", "explanation"],
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "value": {"type": "string"},
+                                        "explanation": {"type": "string"},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        }
+        brief_context = {
+            "title": brief.title,
+            "duration_seconds": brief.duration_seconds,
+            "fps": brief.fps,
+            "language": brief.language,
+            "style": brief.style,
+        }
+        prompt = (
+            "根据用户的原始创作提示词，判断是否还有会明显影响成片的问题需要确认。"
+            "一次最多提出 3 个问题，只问高影响、尚未确定的信息。"
+            "如果信息已经足够，needs_clarification 必须为 false，questions 返回空数组。"
+            "只返回符合 JSON Schema 的 JSON，不要解释。\n\n"
+            f"原始提示词：{brief.request}\n"
+            f"已确定信息：{json.dumps(history, ensure_ascii=False)}\n"
+            f"基础参数：{json.dumps(brief_context, ensure_ascii=False)}"
+        )
+        raw = self.llm_provider.complete(prompt, schema=schema)
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("LLM clarification response is not valid JSON") from error
+        if not isinstance(value, Mapping) or not isinstance(value.get("needs_clarification"), bool) or not isinstance(value.get("questions"), list):
+            raise ValueError("LLM clarification response has an invalid shape")
+        if not value["needs_clarification"]:
+            return []
+        turns: list[ClarificationTurn] = []
+        for item in value["questions"][:3]:
+            if not isinstance(item, Mapping) or not isinstance(item.get("question"), str) or not item["question"].strip():
+                raise ValueError("LLM clarification returned an invalid question")
+            options: list[ClarificationOption] = []
+            raw_options = item.get("options", [])
+            if not isinstance(raw_options, list):
+                raise ValueError("LLM clarification options must be an array")
+            for option in raw_options[:4]:
+                if not isinstance(option, Mapping) or not all(isinstance(option.get(key), str) and option[key].strip() for key in ("label", "value", "explanation")):
+                    raise ValueError("LLM clarification returned an invalid option")
+                options.append(ClarificationOption(option["label"].strip(), option["value"].strip(), option["explanation"].strip()))
+            turns.append(ClarificationTurn(question=item["question"].strip(), required=bool(item.get("required", True)), options=options, source="llm"))
+        if not turns:
+            raise ValueError("LLM requested clarification but returned no questions")
         return turns
 
     @staticmethod

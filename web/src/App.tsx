@@ -1,125 +1,424 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Activity, ArrowRight, Check, CircleAlert, Film, Gauge, GitBranch, Inbox, KeyRound, LoaderCircle, LogOut, Play, Plus, RotateCcw, Save, Settings2, ShieldCheck, Sparkles, Trash2, WalletCards } from 'lucide-react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import {
+  Activity, ArrowLeft, ArrowRight, Check, CircleAlert, Download, ExternalLink,
+  Film, FolderOpen, KeyRound, LoaderCircle, LogOut, Moon, Play, Plus,
+  RefreshCw, RotateCcw, Save, Settings2, ShieldCheck, Sun, Trash2,
+} from 'lucide-react';
 import './styles.css';
 
 type AuthState = { enabled: boolean; initialized: boolean; authenticated: boolean; username?: string | null };
+type Brief = {
+  request: string; title: string; target_audience?: string | null; duration_seconds: number;
+  aspect_ratio: string; fps: number; style?: string | null; language: string;
+  content_constraints: string[]; audio_required: boolean; shot_duration_seconds: number;
+  max_shots: number; budget_usd: number; parallelism_mode: string; parallelism?: number | null;
+  resolution_mode: string; resolution_width?: number | null; resolution_height?: number | null;
+  acceptance_mode: string; acceptance_custom?: string | null;
+};
 type ClarificationOption = { id: string; label: string; value: string; explanation: string };
 type ClarificationTurn = { id: string; question: string; confirmed: boolean; options?: ClarificationOption[]; skipped?: boolean; answer?: string | null };
-type Brief = { request: string; title: string; budget_usd: number; duration_seconds: number; shot_duration_seconds: number; parallelism_mode: string; parallelism?: number | null; resolution_mode: string; resolution_width?: number | null; resolution_height?: number | null; acceptance_mode: string; acceptance_custom?: string | null };
 type Criterion = { id: string; category: string; statement: string };
-type Shot = { id: string; sequence: number; title: string; description: string; acceptance_criteria: Criterion[]; prompt_bundle?: { positive: string; version: number } };
-type Attempt = { shot_id: string; number: number; status: string; judge_result?: { verdict: string; criterion_results: { criterion_id: string; verdict: string; failure_code?: string; reason?: string; skipped?: boolean }[] } };
-type Project = { id: string; name: string; status: string; total_cost_usd: number; brief: Brief; clarification_turns: ClarificationTurn[]; plans: { shots: Shot[]; resolved_settings?: Record<string, unknown>; status?: string }[]; attempts: Attempt[]; artifacts: { uri: string }[]; version?: number; root_project_id?: string; parent_project_id?: string | null; revision?: number };
+type Shot = { id: string; sequence: number; title: string; description: string; duration_seconds?: number; acceptance_criteria: Criterion[]; prompt_bundle?: { positive: string; version: number } };
+type Plan = { id: string; version: number; status: string; shots: Shot[]; resolved_settings?: Record<string, unknown>; approved_by?: string | null };
+type Artifact = { id: string; kind: string; uri: string; mime_type?: string | null; metadata?: Record<string, unknown> };
+type Attempt = {
+  id?: string; shot_id: string; number: number; status: string; artifacts?: Artifact[];
+  judge_result?: { verdict: string; summary?: string; criterion_results: { criterion_id: string; verdict: string; failure_code?: string; reason?: string }[] };
+};
+type Project = {
+  id: string; name: string; status: string; total_cost_usd: number; brief: Brief;
+  clarification_turns: ClarificationTurn[]; plans: Plan[]; attempts: Attempt[]; artifacts: Artifact[];
+  version?: number; root_project_id?: string; parent_project_id?: string | null; revision?: number; updated_at?: string;
+};
 type ProjectSummary = { id: string; name: string; status: string; version: number; root_project_id: string; parent_project_id?: string | null; updated_at: string; total_cost_usd: number };
-type CustomProvider = { id: string; name: string; capability: string; base_url?: string; submit_url?: string; poll_url?: string; api_key?: string; model?: string; method?: string; headers?: Record<string, string>; body_template?: Record<string, unknown>; poll?: Record<string, unknown>; result?: Record<string, unknown>; timeout_seconds?: number; cost_per_second_usd?: number };
 type EventRecord = { id: number; event_type: string; payload: Record<string, unknown>; created_at: string };
-type SettingsResponse = { settings: Record<string, string | number | boolean>; requires_restart: string[]; llm_configured?: boolean; vlm_configured?: boolean };
-type Answer = string | { answer?: string; skip?: boolean };
+type CustomProvider = {
+  id: string; name: string; capability: string; base_url?: string; submit_url?: string; poll_url?: string;
+  api_key?: string; model?: string; method?: string; headers?: Record<string, string>;
+  body_template?: Record<string, unknown>; poll?: Record<string, unknown>; result?: Record<string, unknown>;
+  timeout_seconds?: number; cost_per_second_usd?: number;
+};
+type SettingsResponse = { settings: Record<string, string | number | boolean>; requires_restart?: string[]; providers?: CustomProvider[]; llm_configured?: boolean; vlm_configured?: boolean };
+type ProviderJson = { headers: string; body_template: string; poll: string; result: string };
+type Route = 'projects' | 'new' | 'clarify' | 'plan' | 'progress' | 'review' | 'delivery' | 'settings' | 'advanced';
 
-const briefPayload = { title: '新的视频项目', request: '一位主角在雨夜城市找到一封遗失的信，并在黎明前将它归还。包含旁白、音乐和清晰字幕。', duration_seconds: 30, shot_duration_seconds: 15, max_shots: 10, budget_usd: 75, language: 'zh-CN', audio_required: true, style: '电影感写实' };
+const phaseNames = ['需求澄清', '计划审核', '制作进度', '质量验收', '成片交付'];
+const phaseRoutes: Route[] = ['clarify', 'plan', 'progress', 'review', 'delivery'];
+const settingLabels: Record<string, string> = {
+  VIDEO_PROVIDER: '视频 Provider', VIDEO_MODEL: '视频模型', DIRECTOR_LLM_MODEL: 'LLM 模型',
+  DIRECTOR_VLM_MODEL: 'VLM 模型', LLM_PROVIDER: 'LLM 适配器', VLM_PROVIDER: 'VLM 适配器',
+  DIRECTOR_PROJECT_BUDGET_USD: '默认项目预算（美元）', DIRECTOR_DEFAULT_DURATION_SECONDS: '默认总时长（秒）',
+  DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS: '默认镜头时长（秒）', DIRECTOR_DEFAULT_MAX_SHOTS: '默认最大镜头数',
+  DIRECTOR_DEFAULT_ACCEPTANCE_MODE: '默认验收策略', DIRECTOR_PARALLELISM: '默认并发',
+  DIRECTOR_AUTH_ENABLED: '登录保护', DIRECTOR_HOST_CHECK_ENABLED: 'Host 限制',
+  DIRECTOR_CORS_ENABLED: 'CORS 限制', DIRECTOR_RATE_LIMIT_ENABLED: '请求限流',
+  DIRECTOR_CONTENT_SAFETY_ENABLED: '内容安全审核', DIRECTOR_PROVIDER_SAFETY_ENABLED: 'Provider 安全策略',
+  DIRECTOR_MAX_ATTEMPTS: '单镜头最大尝试次数', DIRECTOR_DATABASE_URL: '数据库连接',
+  REDIS_URL: 'Redis 连接', OBJECT_STORAGE_ENDPOINT: '对象存储连接', OPENAI_BASE_URL: '模型 API 地址',
+  OPENAI_API_KEY: 'OpenAI 兼容 API Key', AGNES_API_KEY: 'Agnes API Key',
+  AGNES_BACKUP_API_KEY: 'Agnes 备用 API Key',
+};
+const statusLabels: Record<string, string> = {
+  clarifying: '等待需求澄清', awaiting_plan_approval: '等待计划审核', planned: '计划已就绪',
+  generating: '正在制作', judging: '正在验收', repairing: '正在修复',
+  awaiting_human: '等待人工处理', assembling: '正在组装', delivered: '已交付',
+  failed: '执行失败', cancelled: '已取消',
+};
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) } });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(String(body.detail || `请求失败（${response.status}）`)); }
+  const response = await fetch(path, {
+    ...init, credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(String(body.detail || `请求失败（${response.status}）`));
+  }
   return response.json() as Promise<T>;
 }
 
-export function App() {
-  const [auth, setAuth] = useState<AuthState | null>(null); const [authLoading, setAuthLoading] = useState(true); const [loading, setLoading] = useState(true);
-  const [project, setProject] = useState<Project | null>(null); const [projectList, setProjectList] = useState<ProjectSummary[]>([]); const [events, setEvents] = useState<EventRecord[]>([]); const [selected, setSelected] = useState(0);
-  const [running, setRunning] = useState(false); const [notice, setNotice] = useState('正在连接导演运行时…'); const [error, setError] = useState<string | null>(null); const [answers, setAnswers] = useState<Record<string, Answer>>({});
-  const [activeNav, setActiveNav] = useState<'control' | 'projects' | 'review' | 'settings' | 'advanced'>('control'); const [settings, setSettings] = useState<SettingsResponse | null>(null); const [settingsDraft, setSettingsDraft] = useState<Record<string, string | number | boolean>>({}); const [settingsMode, setSettingsMode] = useState<'basic' | 'advanced'>('basic');
-  const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]); const [providerDraft, setProviderDraft] = useState<CustomProvider>({ id: '', name: '', capability: 'video', submit_url: '', api_key: '', method: 'POST', body_template: {}, poll: {}, result: {} }); const [rewindTarget, setRewindTarget] = useState<string | null>(null);
-
-  const refresh = useCallback(async (projectId: string) => { const [next, nextEvents] = await Promise.all([apiFetch<Project>(`/v1/projects/${projectId}`), apiFetch<EventRecord[]>(`/v1/projects/${projectId}/events`)]); const currentPlan = [...next.plans].reverse().find((candidate) => candidate.status !== 'obsolete'); setProject(next); setEvents(nextEvents); const count = currentPlan?.shots.length || 1; setSelected((current) => Math.min(current, Math.max(0, count - 1))); setNotice(next.clarification_turns.filter((turn) => !turn.confirmed).length ? '还有需求信息待确认' : statusLabel(next.status)); setError(null); }, []);
-  const bootstrapAuth = useCallback(async () => { try { const status = await apiFetch<{ enabled: boolean; initialized: boolean; username?: string | null }>('/v1/auth/status'); if (!status.enabled) setAuth({ ...status, authenticated: true }); else if (!status.initialized) setAuth({ ...status, authenticated: false }); else { try { const me = await apiFetch<{ username: string }>('/v1/auth/me'); setAuth({ ...status, authenticated: true, username: me.username }); } catch { setAuth({ ...status, authenticated: false }); } } } catch (cause) { setError(cause instanceof Error ? cause.message : '认证服务不可用'); } finally { setAuthLoading(false); } }, []);
-  useEffect(() => { void bootstrapAuth(); }, [bootstrapAuth]);
-  useEffect(() => { if (!auth?.authenticated) { setLoading(false); return; } let cancelled = false; (async () => { try { const listed = await apiFetch<ProjectSummary[]>('/v1/projects'); setProjectList(listed); let projectId = window.localStorage.getItem('director-project-id'); let next: Project; if (projectId && listed.some((item) => item.id === projectId)) next = await apiFetch<Project>(`/v1/projects/${projectId}`); else if (listed[0]) { projectId = listed[0].id; next = await apiFetch<Project>(`/v1/projects/${projectId}`); } else { next = await apiFetch<Project>('/v1/projects', { method: 'POST', body: JSON.stringify(briefPayload) }); projectId = next.id; } const runtime = await apiFetch<SettingsResponse>('/v1/settings'); setSettings(runtime); setSettingsDraft(runtime.settings); setCustomProviders(await apiFetch<CustomProvider[]>('/v1/providers/custom').catch(() => [])); if (cancelled) return; window.localStorage.setItem('director-project-id', projectId!); await refresh(next.id); } catch (cause) { if (!cancelled) { setError(cause instanceof Error ? cause.message : '导演 API 当前不可用'); setNotice('运行时离线'); } } finally { if (!cancelled) setLoading(false); } })(); return () => { cancelled = true; }; }, [auth?.authenticated, refresh]);
-  useEffect(() => { if (!project || !auth?.authenticated) return; const source = new EventSource(`/v1/projects/${project.id}/events/stream?follow=true`); source.onmessage = (message) => { try { const event = JSON.parse(message.data) as EventRecord; setEvents((current) => current.some((item) => item.id === event.id) ? current : current.concat(event)); } catch { /* REST refresh remains authoritative. */ } }; const timer = window.setInterval(() => { void refresh(project.id); }, 5000); return () => { source.close(); window.clearInterval(timer); }; }, [project?.id, auth?.authenticated, refresh]);
-
-  const activePlan = project ? [...project.plans].reverse().find((candidate) => candidate.status !== 'obsolete') : undefined; const shots = activePlan?.shots || []; const resolved = activePlan?.resolved_settings || {}; const active = shots[selected] || shots[0]; const latest = useMemo(() => { const map = new Map<string, Attempt>(); for (const attempt of project?.attempts || []) { const current = map.get(attempt.shot_id); if (!current || attempt.number > current.number) map.set(attempt.shot_id, attempt); } return map; }, [project?.attempts]); const unresolved = project?.clarification_turns.filter((turn) => !turn.confirmed) || []; const passCount = shots.filter((shot) => latest.get(shot.id)?.judge_result?.verdict === 'PASS').length; const criteriaCount = shots.reduce((sum, shot) => sum + shot.acceptance_criteria.length, 0); const passedCriteria = shots.reduce((sum, shot) => sum + (latest.get(shot.id)?.judge_result?.criterion_results || []).filter((item) => item.verdict === 'PASS').length, 0);
-  const [setupForm, setSetupForm] = useState({ username: '', password: '', confirm: '' }); const [loginForm, setLoginForm] = useState({ username: '', password: '' });
-  const submitAuth = async (mode: 'setup' | 'login') => { setRunning(true); try { if (mode === 'setup') { if (setupForm.password !== setupForm.confirm) throw new Error('两次密码输入不一致'); await apiFetch('/v1/auth/setup', { method: 'POST', body: JSON.stringify({ username: setupForm.username, password: setupForm.password }) }); await apiFetch('/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: setupForm.username, password: setupForm.password }) }); } else await apiFetch('/v1/auth/login', { method: 'POST', body: JSON.stringify(loginForm) }); await bootstrapAuth(); } catch (cause) { setError(cause instanceof Error ? cause.message : '认证失败'); } finally { setRunning(false); } };
-  const submitAnswers = async () => { if (!project) return; setRunning(true); try { await apiFetch(`/v1/projects/${project.id}/clarifications`, { method: 'POST', body: JSON.stringify(answers) }); await refresh(project.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '澄清信息保存失败'); } finally { setRunning(false); } };
-  const saveProjectSettings = async () => { if (!project) return; setRunning(true); try { await apiFetch(`/v1/projects/${project.id}/settings`, { method: 'PATCH', body: JSON.stringify(project.brief) }); await refresh(project.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '项目参数保存失败'); } finally { setRunning(false); } };
-  const loadSettings = async () => { try { const response = await apiFetch<SettingsResponse>('/v1/settings'); setSettings(response); setSettingsDraft(response.settings); setCustomProviders(await apiFetch<CustomProvider[]>('/v1/providers/custom').catch(() => [])); } catch (cause) { setError(cause instanceof Error ? cause.message : '设置读取失败'); } };
-  const saveSettings = async () => { setRunning(true); try { const basicKeys = ['DIRECTOR_PROJECT_BUDGET_USD', 'DIRECTOR_DEFAULT_DURATION_SECONDS', 'DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS', 'DIRECTOR_DEFAULT_MAX_SHOTS', 'DIRECTOR_DEFAULT_ACCEPTANCE_MODE', 'DIRECTOR_PARALLELISM', 'VIDEO_PROVIDER', 'VIDEO_MODEL', 'DIRECTOR_LLM_MODEL', 'DIRECTOR_VLM_MODEL', 'LLM_PROVIDER', 'VLM_PROVIDER', 'OPENAI_API_KEY', 'FAL_API_KEY', 'REPLICATE_API_TOKEN']; const advancedKeys = ['DIRECTOR_AUTH_ENABLED', 'DIRECTOR_HOST_CHECK_ENABLED', 'DIRECTOR_CORS_ENABLED', 'DIRECTOR_RATE_LIMIT_ENABLED', 'DIRECTOR_CONTENT_SAFETY_ENABLED', 'DIRECTOR_PROVIDER_SAFETY_ENABLED', 'DIRECTOR_DATABASE_URL', 'REDIS_URL', 'OBJECT_STORAGE_ENDPOINT', 'DIRECTOR_MAX_ATTEMPTS']; const allowed = settingsMode === 'basic' ? basicKeys : advancedKeys; const payload = Object.fromEntries(allowed.filter((key) => key in settingsDraft).map((key) => [key, settingsDraft[key]])); const response = await apiFetch<SettingsResponse>(settingsMode === 'basic' ? '/v1/settings/basic' : '/v1/settings/advanced', { method: 'PATCH', body: JSON.stringify(payload) }); setSettings(response); setSettingsDraft({ ...settingsDraft, ...response.settings }); setNotice('设置已保存，新任务会读取最新配置。'); } catch (cause) { setError(cause instanceof Error ? cause.message : '设置保存失败'); } finally { setRunning(false); } };
-  const loadProjects = async () => { const listed = await apiFetch<ProjectSummary[]>('/v1/projects'); setProjectList(listed); return listed; }; const selectProject = async (id: string) => { setRunning(true); try { window.localStorage.setItem('director-project-id', id); await refresh(id); setActiveNav('control'); } catch (cause) { setError(cause instanceof Error ? cause.message : '项目切换失败'); } finally { setRunning(false); } }; const createProject = async () => { setRunning(true); try { const next = await apiFetch<Project>('/v1/projects', { method: 'POST', body: JSON.stringify({ ...briefPayload, title: `新的视频项目 ${projectList.length + 1}` }) }); await loadProjects(); await selectProject(next.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '新建项目失败'); } finally { setRunning(false); } }; const createVersion = async () => { if (!project) return; setRunning(true); try { const next = await apiFetch<Project>(`/v1/projects/${project.id}/versions`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) }); await loadProjects(); await selectProject(next.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '新版本创建失败'); } finally { setRunning(false); } };
-  const rewind = async () => { if (!project || !rewindTarget) return; setRunning(true); try { await apiFetch(`/v1/projects/${project.id}/rewind`, { method: 'POST', body: JSON.stringify({ target_phase: rewindTarget, actor: auth?.username || 'operator', expected_revision: project.revision }) }); setRewindTarget(null); await refresh(project.id); setNotice('已回退到指定阶段，下游结果已标记为失效。'); } catch (cause) { setError(cause instanceof Error ? cause.message : '阶段回退失败'); } finally { setRunning(false); } };
-  const saveProvider = async () => { setRunning(true); try { const existing = customProviders.find((item) => item.id === providerDraft.id); const response = await apiFetch<CustomProvider>(existing ? `/v1/providers/custom/${providerDraft.id}` : '/v1/providers/custom', { method: existing ? 'PATCH' : 'POST', body: JSON.stringify(providerDraft) }); setCustomProviders(await apiFetch<CustomProvider[]>('/v1/providers/custom')); setProviderDraft({ ...response, api_key: '' }); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Provider 保存失败'); } finally { setRunning(false); } }; const deleteProvider = async (id: string) => { if (!window.confirm('确认删除这个自定义 Provider？')) return; await apiFetch(`/v1/providers/custom/${id}`, { method: 'DELETE' }); setCustomProviders(await apiFetch<CustomProvider[]>('/v1/providers/custom')); };
-  const runQualityLoop = async () => { if (!project) return; if (project.status === 'delivered') { await createVersion(); return; } setRunning(true); try { let next = project; if (!next.plans.length) next = await apiFetch<Project>(`/v1/projects/${next.id}/plan`, { method: 'POST' }); next = await apiFetch<Project>(`/v1/projects/${next.id}/run`, { method: 'POST', body: JSON.stringify({ approve_plan: true, actor: auth?.username || 'operator' }) }); await refresh(next.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '质量闭环执行失败'); } finally { setRunning(false); } }; const retryShot = async () => { if (!project || !active) return; setRunning(true); try { await apiFetch(`/v1/projects/${project.id}/shots/${active.id}/retry`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) }); await refresh(project.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '当前无法重试镜头'); } finally { setRunning(false); } }; const deliver = async () => { if (!project) return; setRunning(true); try { await apiFetch(`/v1/projects/${project.id}/deliver`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) }); await refresh(project.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '交付审批失败'); } finally { setRunning(false); } };
-  const navigate = (section: typeof activeNav) => { setActiveNav(section); if (section === 'settings' || section === 'advanced') { setSettingsMode(section === 'advanced' ? 'advanced' : 'basic'); void loadSettings(); return; } const target = section === 'control' ? 'control-room' : section === 'projects' ? 'shot-queue' : unresolved.length ? 'clarification-gate' : 'review-gate'; window.requestAnimationFrame(() => document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' })); };
-  if (authLoading || loading) return <div className="loading-screen" role="status"><LoaderCircle size={20} className="spin" />正在读取导演状态</div>; if (auth && auth.enabled && !auth.authenticated) { const setup = !auth.initialized; const form = setup ? setupForm : loginForm; return <AuthPanel setup={setup} form={form} setForm={(value) => setup ? setSetupForm({ username: value.username, password: value.password, confirm: value.confirm || '' }) : setLoginForm({ username: value.username, password: value.password })} onSubmit={() => void submitAuth(setup ? 'setup' : 'login')} error={error} running={running} />; }
-  const phase = phaseFor(project?.status); const phaseIds = ['clarification-gate', 'project-settings', 'shot-queue', 'review-gate', 'review-gate', 'review-gate'];
-  return <><a className="skip-link" href="#control-room">跳转到主要内容</a><div className="app-shell"><aside className="sidebar"><div className="brand"><img className="brand-logo" src="/opencine-ai-logo.png" alt="OpenCine-AI" /><div><strong>OpenCine-AI</strong><span>AI 视频制作系统</span></div></div><nav aria-label="主导航"><NavButton active={activeNav === 'control'} icon={<Activity size={16} />} label="控制台" onClick={() => navigate('control')} /><NavButton active={activeNav === 'projects'} icon={<GitBranch size={16} />} label="项目" onClick={() => navigate('projects')} /><NavButton active={activeNav === 'review'} icon={<Inbox size={16} />} label="待审核" count={unresolved.length + (project?.status === 'awaiting_human' ? 1 : 0)} onClick={() => navigate('review')} /><NavButton active={activeNav === 'settings'} icon={<Settings2 size={16} />} label="设置" onClick={() => navigate('settings')} /><NavButton active={activeNav === 'advanced'} icon={<ShieldCheck size={16} />} label="高级设置" onClick={() => navigate('advanced')} /></nav><div className="sidebar-foot"><div className="provider"><span className="pulse" />运行时已连接</div><small>Provider 适配器 · Mock / Fal 风格 / ComfyUI</small><button className="quiet sidebar-logout" onClick={() => void apiFetch('/v1/auth/logout', { method: 'POST' }).finally(() => setAuth((current) => current ? { ...current, authenticated: false } : current))}><LogOut size={14} />退出登录</button></div></aside><main className="main" id="control-room" tabIndex={-1}><header className="topbar"><div><p className="eyebrow">项目 / {(project?.name || 'OPENCINE-AI').toUpperCase()}</p><h1>{activeNav === 'settings' ? '设置' : activeNav === 'advanced' ? '高级设置' : activeNav === 'projects' ? '项目与镜头' : activeNav === 'review' ? '待审核事项' : '制作控制台'}</h1></div><div className="top-actions"><span className="status-chip"><span className="dot" />{statusLabel(project?.status)}</span><button className="icon-button" aria-label="刷新项目状态" title="刷新项目状态" onClick={() => project && refresh(project.id)}><Activity size={18} /></button><div className="avatar">{(auth?.username || 'OP').slice(0, 2).toUpperCase()}</div></div></header>{(activeNav === 'settings' || activeNav === 'advanced') ? <SettingsPanel mode={settingsMode} settings={settings} draft={settingsDraft} setDraft={setSettingsDraft} providers={customProviders} providerDraft={providerDraft} setProviderDraft={setProviderDraft} onSave={saveSettings} onSaveProvider={saveProvider} onDeleteProvider={deleteProvider} running={running} /> : <><section className="phase-bar" aria-label="制作阶段">{phases.map((name, index) => { const reached = index <= phase; return <button key={name} className={`phase ${index < phase ? 'done' : ''} ${index === phase ? 'current' : ''}`} disabled={!reached || running} onClick={() => { document.getElementById(phaseIds[index])?.scrollIntoView({ behavior: 'smooth', block: 'start' }); if (index < phase && index < 5) setRewindTarget(['requirements', 'plan', 'generation', 'review', 'repair'][index]); }}>{index < phase ? <Check size={13} /> : index + 1}{name}{index < phases.length - 1 && <ArrowRight size={13} />}</button>; })}</section>{rewindTarget && <div className="notice notice-warning" role="alert"><CircleAlert size={16} /><span>确认回退到“{phaseName(rewindTarget)}”？下游结果将标记为失效。</span><button className="primary" onClick={() => void rewind()} disabled={running}><Check size={14} />确认回退</button><button className="quiet" onClick={() => setRewindTarget(null)}>取消</button></div>}<section className={`notice ${error ? 'notice-error' : ''}`} role={error ? 'alert' : 'status'}><Sparkles size={16} /><span>{error || notice}</span><button onClick={() => project && refresh(project.id)}><RotateCcw size={15} />刷新状态</button></section><ProjectSwitcher projects={projectList} current={project} onSelect={(id) => void selectProject(id)} onCreate={() => void createProject()} onVersion={() => void createVersion()} running={running} />{project && <ProjectSettings project={project} setProject={setProject} resolved={resolved} onSave={() => void saveProjectSettings()} running={running} />}{unresolved.length > 0 && <ClarificationPanel turns={unresolved} answers={answers} setAnswers={setAnswers} onSubmit={() => void submitAnswers()} running={running} />}<section className="metrics" aria-label="项目指标"><Metric icon={<Film size={17} />} label="镜头" value={shots.length ? `${passCount} / ${shots.length}` : '—'} detail={shots.length ? '已通过' : '尚未规划'} /><Metric icon={<ShieldCheck size={17} />} label="验收" value={criteriaCount ? `${passedCriteria} / ${criteriaCount}` : '—'} detail="项通过" /><Metric icon={<WalletCards size={17} />} label="费用" value={`$${(project?.total_cost_usd || 0).toFixed(2)}`} detail={`预算 $${(project?.brief.budget_usd || 0).toFixed(0)}`} /><Metric icon={<Gauge size={17} />} label="生成尝试" value={String(project?.attempts.length || 0)} detail="条溯源记录" /></section><div className="work-grid"><section className="panel shots-panel" id="shot-queue"><div className="panel-head"><div><p className="eyebrow">执行队列</p><h2>镜头队列</h2></div><button className="primary" onClick={() => void runQualityLoop()} disabled={running || unresolved.length > 0}><Play size={15} />{running ? '执行中…' : project?.status === 'delivered' ? '生成新版本' : shots.length ? '运行质量闭环' : '生成计划'}</button></div>{shots.length ? <div className="shot-list">{shots.map((shot, index) => { const verdict = latest.get(shot.id)?.judge_result?.verdict; return <button key={shot.id} className={`shot-row ${selected === index ? 'selected' : ''}`} aria-pressed={selected === index} onClick={() => setSelected(index)}><span className="shot-number">{String(shot.sequence).padStart(2, '0')}</span><span className="shot-copy"><strong>{shot.title}</strong><small>{shot.description}</small></span><span className="result">{verdictLabel(verdict || 'QUEUED')}</span><ArrowRight size={15} className="row-arrow" /></button>; })}</div> : <div className="empty-state"><CircleAlert size={18} />确认澄清信息后，系统会创建镜头计划。</div>}</section><ShotDetail active={active} latest={latest} onRetry={() => void retryShot()} running={running} /></div><section className="bottom-grid"><div className="panel timeline-panel"><div className="panel-head"><div><p className="eyebrow">审计轨迹</p><h2>Agent 决策</h2></div><button className="quiet" onClick={() => project && refresh(project.id)}>刷新事件流 <ArrowRight size={14} /></button></div><div className="events">{events.slice(-8).reverse().map((event) => <Event key={event.id} event={event} />)}</div></div><div className="panel gate-panel" id="review-gate"><p className="eyebrow">下一个人工门禁</p><h2>{project?.status === 'awaiting_human' ? '审批最终组装' : project?.status === 'delivered' ? '交付已完成' : '当前无需人工处理'}</h2><p>{project?.artifacts.length ? project.artifacts[project.artifacts.length - 1].uri : '所有镜头通过后，组装产物会显示在这里。'}</p><button className="primary wide" onClick={() => void deliver()} disabled={running || project?.status !== 'awaiting_human' || !project?.artifacts.length}><ShieldCheck size={15} />批准交付</button></div></section></>}</main></div></>;
+function routeFromHash(): Route {
+  const value = window.location.hash.replace(/^#\/?/, '').split('/')[0] as Route;
+  return ['projects', 'new', 'clarify', 'plan', 'progress', 'review', 'delivery', 'settings', 'advanced'].includes(value) ? value : 'projects';
 }
 
-function ProjectSwitcher({ projects, current, onSelect, onCreate, onVersion, running }: { projects: ProjectSummary[]; current: Project | null; onSelect: (id: string) => void; onCreate: () => void; onVersion: () => void; running: boolean }) { return <section className="panel project-switcher"><div className="panel-head"><div><p className="eyebrow">项目工作区</p><h2>项目与版本</h2></div><div className="button-row"><button className="quiet" onClick={onCreate} disabled={running}><Plus size={15} />新建项目</button>{current && <button className="primary" onClick={onVersion} disabled={running}><GitBranch size={15} />生成新版本</button>}</div></div><select aria-label="选择项目" value={current?.id || ''} onChange={(event) => onSelect(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name} · v{item.version} · {statusLabel(item.status)}</option>)}</select></section>; }
-function SettingsPanel({ mode, settings, draft, setDraft, providers, providerDraft, setProviderDraft, onSave, onSaveProvider, onDeleteProvider, running }: { mode: 'basic' | 'advanced'; settings: SettingsResponse | null; draft: Record<string, string | number | boolean>; setDraft: (value: Record<string, string | number | boolean>) => void; providers: CustomProvider[]; providerDraft: CustomProvider; setProviderDraft: (value: CustomProvider) => void; onSave: () => void; onSaveProvider: () => void; onDeleteProvider: (id: string) => void; running: boolean }) {
-  const basic = ['DIRECTOR_PROJECT_BUDGET_USD', 'DIRECTOR_DEFAULT_DURATION_SECONDS', 'DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS', 'DIRECTOR_DEFAULT_MAX_SHOTS', 'DIRECTOR_DEFAULT_ACCEPTANCE_MODE', 'DIRECTOR_PARALLELISM', 'VIDEO_PROVIDER', 'VIDEO_MODEL', 'LLM_PROVIDER', 'VLM_PROVIDER', 'DIRECTOR_LLM_MODEL', 'DIRECTOR_VLM_MODEL'];
-  const bools = ['DIRECTOR_AUTH_ENABLED', 'DIRECTOR_HOST_CHECK_ENABLED', 'DIRECTOR_CORS_ENABLED', 'DIRECTOR_RATE_LIMIT_ENABLED', 'DIRECTOR_CONTENT_SAFETY_ENABLED', 'DIRECTOR_PROVIDER_SAFETY_ENABLED'];
-  const advanced = ['DIRECTOR_DATABASE_URL', 'REDIS_URL', 'OBJECT_STORAGE_ENDPOINT', 'DIRECTOR_MAX_ATTEMPTS'];
-  const keys = mode === 'basic' ? basic : [...bools, ...advanced];
-  const labels: Record<string, string> = { LLM_PROVIDER: 'LLM Provider', VLM_PROVIDER: 'VLM Provider', DIRECTOR_MAX_ATTEMPTS: '最大自动尝试次数' };
-  const [bodyText, setBodyText] = useState(JSON.stringify(providerDraft.body_template || {}, null, 2));
-  const [headersText, setHeadersText] = useState(JSON.stringify(providerDraft.headers || {}, null, 2));
-  const [mappingText, setMappingText] = useState(JSON.stringify({ poll: providerDraft.poll || {}, result: providerDraft.result || {} }, null, 2));
+export function App() {
+  const [route, setRoute] = useState<Route>(routeFromHash());
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const saved = window.localStorage.getItem('opencine-theme');
+    return saved === 'dark' || saved === 'light' ? saved : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  });
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [projectList, setProjectList] = useState<ProjectSummary[]>([]);
+  const [project, setProject] = useState<Project | null>(null);
+  const [events, setEvents] = useState<EventRecord[]>([]);
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [providers, setProviders] = useState<CustomProvider[]>([]);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [queuedJobId, setQueuedJobId] = useState<string | null>(null);
+  const [setupForm, setSetupForm] = useState({ username: '', password: '', confirm: '' });
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [projectId, setProjectId] = useState<string | null>(() => window.localStorage.getItem('director-project-id'));
+
+  const navigate = useCallback((next: Route) => { window.location.hash = `#/${next}`; setRoute(next); }, []);
+  const refreshProject = useCallback(async (id: string) => {
+    const [next, nextEvents] = await Promise.all([
+      apiFetch<Project>(`/v1/projects/${id}`),
+      apiFetch<EventRecord[]>(`/v1/projects/${id}/events`),
+    ]);
+    setProject(next); setEvents(nextEvents); setProjectId(next.id);
+    window.localStorage.setItem('director-project-id', next.id);
+    setError(null);
+    return next;
+  }, []);
+  const loadSettings = useCallback(async () => {
+    const response = await apiFetch<SettingsResponse>('/v1/settings');
+    setSettings(response);
+    setProviders(await apiFetch<CustomProvider[]>('/v1/providers/custom').catch(() => []));
+  }, []);
+  const loadProjects = useCallback(async () => {
+    const list = await apiFetch<ProjectSummary[]>('/v1/projects');
+    setProjectList(list);
+    return list;
+  }, []);
 
   useEffect(() => {
-    setBodyText(JSON.stringify(providerDraft.body_template || {}, null, 2));
-    setHeadersText(JSON.stringify(providerDraft.headers || {}, null, 2));
-    setMappingText(JSON.stringify({ poll: providerDraft.poll || {}, result: providerDraft.result || {} }, null, 2));
-  }, [providerDraft.id]);
-
-  const updateJson = (value: string, field: 'body_template' | 'headers', update: (text: string) => void) => {
-    update(value);
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem('opencine-theme', theme);
+  }, [theme]);
+  useEffect(() => {
+    const listener = () => setRoute(routeFromHash());
+    window.addEventListener('hashchange', listener);
+    return () => window.removeEventListener('hashchange', listener);
+  }, []);
+  const bootstrap = useCallback(async () => {
     try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) setProviderDraft({ ...providerDraft, [field]: parsed });
-    } catch { /* keep the draft text until the JSON is valid */ }
+      const status = await apiFetch<{ enabled: boolean; initialized: boolean; username?: string | null }>('/v1/auth/status');
+      if (!status.enabled) setAuth({ ...status, authenticated: true });
+      else if (!status.initialized) setAuth({ ...status, authenticated: false });
+      else {
+        try {
+          const me = await apiFetch<{ username: string }>('/v1/auth/me');
+          setAuth({ ...status, authenticated: true, username: me.username });
+        } catch { setAuth({ ...status, authenticated: false }); }
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '认证服务不可用'); }
+    finally { setAuthLoading(false); }
+  }, []);
+  useEffect(() => { void bootstrap(); }, [bootstrap]);
+  useEffect(() => {
+    if (!auth?.authenticated) { setLoading(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await loadProjects();
+        await loadSettings();
+        const selected = projectId && list.some((item) => item.id === projectId) ? projectId : list[0]?.id;
+        if (!cancelled && selected) await refreshProject(selected);
+        if (!cancelled && !selected) navigate('projects');
+      } catch (cause) { if (!cancelled) setError(cause instanceof Error ? cause.message : '导演 API 当前不可用'); }
+      finally { if (!cancelled) setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [auth?.authenticated, loadProjects, loadSettings, navigate, projectId, refreshProject]);
+  useEffect(() => {
+    if (!project || !auth?.authenticated) return;
+    const timer = window.setInterval(() => { void refreshProject(project.id); }, 5000);
+    return () => window.clearInterval(timer);
+  }, [auth?.authenticated, project?.id, refreshProject]);
+  useEffect(() => {
+    if (project && !['planned', 'awaiting_plan_approval'].includes(project.status)) setQueuedJobId(null);
+  }, [project?.status]);
+
+  const submitAuth = async (mode: 'setup' | 'login') => {
+    setRunning(true); setError(null);
+    try {
+      if (mode === 'setup') {
+        if (setupForm.password !== setupForm.confirm) throw new Error('两次密码输入不一致');
+        await apiFetch('/v1/auth/setup', { method: 'POST', body: JSON.stringify({ username: setupForm.username, password: setupForm.password }) });
+        await apiFetch('/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: setupForm.username, password: setupForm.password }) });
+      } else await apiFetch('/v1/auth/login', { method: 'POST', body: JSON.stringify(loginForm) });
+      await bootstrap();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '认证失败'); }
+    finally { setRunning(false); }
+  };
+  const selectProject = async (id: string, target?: Route) => {
+    setRunning(true);
+    setQueuedJobId(null);
+    try {
+      const next = await refreshProject(id);
+      navigate(target || routeForStatus(next.status));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '项目读取失败'); }
+    finally { setRunning(false); }
+  };
+  const createProject = async (payload: Partial<Brief>) => {
+    setRunning(true); setError(null);
+    setQueuedJobId(null);
+    try {
+      const next = await apiFetch<Project>('/v1/projects', { method: 'POST', body: JSON.stringify(payload) });
+      await loadProjects(); await refreshProject(next.id);
+      navigate(next.clarification_turns.some((turn) => !turn.confirmed) ? 'clarify' : 'plan');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '项目创建失败'); }
+    finally { setRunning(false); }
+  };
+  const createVersion = async () => {
+    if (!project) return;
+    setRunning(true);
+    setQueuedJobId(null);
+    try {
+      const next = await apiFetch<Project>(`/v1/projects/${project.id}/versions`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) });
+      await loadProjects(); await refreshProject(next.id); navigate('clarify');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '新版本创建失败'); }
+    finally { setRunning(false); }
+  };
+  const answerClarifications = async (answers: Record<string, string | { answer?: string; skip?: boolean }>) => {
+    if (!project) return;
+    setRunning(true);
+    try {
+      const next = await apiFetch<Project>(`/v1/projects/${project.id}/clarifications`, { method: 'POST', body: JSON.stringify(answers) });
+      setProject(next);
+      if (next.clarification_turns.every((turn) => turn.confirmed)) navigate('plan');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '需求澄清保存失败'); }
+    finally { setRunning(false); }
+  };
+  const makePlan = async () => {
+    if (!project) return;
+    setRunning(true);
+    try { const next = await apiFetch<Project>(`/v1/projects/${project.id}/plan`, { method: 'POST' }); setProject(next); navigate('plan'); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : '计划生成失败'); }
+    finally { setRunning(false); }
+  };
+  const approvePlan = async () => {
+    if (!project) return;
+    setRunning(true);
+    try {
+      const next = await apiFetch<Project>(`/v1/projects/${project.id}/approve-plan`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) });
+      setProject(next); navigate('progress');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '计划审核失败'); }
+    finally { setRunning(false); }
+  };
+  const runProject = async () => {
+    if (!project) return;
+    setRunning(true);
+    try {
+      const response = await apiFetch<Project | { queued: boolean; job_id: string; project: Project }>(`/v1/projects/${project.id}/run`, { method: 'POST', body: JSON.stringify({ async: true, approve_plan: true, actor: auth?.username || 'operator' }) });
+      if ('queued' in response && response.queued) {
+        setQueuedJobId(response.job_id);
+        setProject(response.project);
+        setNotice('制作任务已排队，后端 Worker 会继续处理。');
+        navigate('progress');
+      } else {
+        const next = response as Project;
+        setProject(next); navigate(next.status === 'delivered' || next.status === 'awaiting_human' ? 'delivery' : 'progress');
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '制作任务启动失败'); }
+    finally { setRunning(false); }
+  };
+  const rewind = async (target: string) => {
+    if (!project) return;
+    if (!window.confirm(`确认回退到“${phaseName(target)}”？下游结果会标记为失效，已产生的费用不会回滚。`)) return;
+    setRunning(true);
+    try {
+      const next = await apiFetch<Project>(`/v1/projects/${project.id}/rewind`, { method: 'POST', body: JSON.stringify({ target_phase: target, actor: auth?.username || 'operator', expected_revision: project.revision }) });
+      setProject(next);
+      navigate(target === 'requirements' ? 'clarify' : target === 'plan' ? 'plan' : 'progress');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '阶段回退失败'); }
+    finally { setRunning(false); }
+  };
+  const deliver = async () => {
+    if (!project) return;
+    setRunning(true);
+    try { const next = await apiFetch<Project>(`/v1/projects/${project.id}/deliver`, { method: 'POST', body: JSON.stringify({ actor: auth?.username || 'operator' }) }); setProject(next); await loadProjects(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : '交付确认失败'); }
+    finally { setRunning(false); }
   };
 
-  const updateMapping = (value: string) => {
-    setMappingText(value);
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) setProviderDraft({ ...providerDraft, poll: parsed.poll || {}, result: parsed.result || {} });
-    } catch { /* keep the draft text until the JSON is valid */ }
-  };
+  if (authLoading || loading) return <div className="loading-screen"><LoaderCircle className="spin" size={20} />正在读取 OpenCine-AI</div>;
+  if (auth && auth.enabled && !auth.authenticated) {
+    return <AuthPage setup={!auth.initialized} form={auth.initialized ? loginForm : setupForm} setForm={auth.initialized ? (value) => setLoginForm({ username: value.username, password: value.password }) : (value) => setSetupForm({ username: value.username, password: value.password, confirm: value.confirm || '' })} onSubmit={() => void submitAuth(auth.initialized ? 'login' : 'setup')} error={error} running={running} />;
+  }
 
-  return <section className="settings-page">
-    <div className="risk-alert"><CircleAlert size={18} /><div><strong>{mode === 'advanced' ? '高级设置会影响安全、费用和连接' : '普通设置会影响新任务默认行为'}</strong><p>{mode === 'advanced' ? '数据库、队列、对象存储和安全开关属于高风险配置。' : 'Provider、预算和默认时长会在新任务及新重试中生效。'}</p></div></div>
-    <section className="panel">
-      <div className="panel-head"><div><p className="eyebrow">{mode === 'advanced' ? '高风险运行时' : '制作默认值'}</p><h2>{mode === 'advanced' ? '高级设置' : '设置'}</h2></div><button className="primary" onClick={onSave} disabled={running || !settings}><Save size={15} />保存设置</button></div>
-      <div className="settings-grid">{keys.map((key) => bools.includes(key) ? <label className="toggle-row" key={key}><span>{labels[key] || settingLabel(key)}</span><input type="checkbox" checked={Boolean(draft[key])} onChange={(event) => setDraft({ ...draft, [key]: event.target.checked })} /></label> : <label key={key}>{labels[key] || settingLabel(key)}<input value={String(draft[key] ?? '')} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>)}</div>
-    </section>
-    {mode === 'basic' && <section className="panel">
-      <div className="panel-head"><div><p className="eyebrow">HTTP 适配器</p><h2>自定义 API Provider</h2></div></div>
-      <div className="provider-list">{providers.map((provider) => <div className="provider-row" key={provider.id}><span><strong>{provider.name}</strong><small>{provider.id} · {provider.capability}</small></span><button className="quiet" onClick={() => setProviderDraft(provider)}>编辑</button><button className="quiet" onClick={() => onDeleteProvider(provider.id)} aria-label={'删除 ' + provider.name}><Trash2 size={14} /></button></div>)}</div>
-      <div className="settings-grid">
-        <label>Provider ID<input value={providerDraft.id} onChange={(event) => setProviderDraft({ ...providerDraft, id: event.target.value })} /></label>
-        <label>名称<input value={providerDraft.name} onChange={(event) => setProviderDraft({ ...providerDraft, name: event.target.value })} /></label>
-        <label>能力<select value={providerDraft.capability} onChange={(event) => setProviderDraft({ ...providerDraft, capability: event.target.value })}><option value="video">视频</option><option value="llm">LLM</option><option value="vlm">VLM</option><option value="audio">音频</option><option value="reference">素材引用</option></select></label>
-        <label>请求方法<select value={providerDraft.method || 'POST'} onChange={(event) => setProviderDraft({ ...providerDraft, method: event.target.value })}><option value="POST">POST</option><option value="PUT">PUT</option><option value="GET">GET</option></select></label>
-        <label>提交 URL<input value={providerDraft.submit_url || providerDraft.base_url || ''} onChange={(event) => setProviderDraft({ ...providerDraft, submit_url: event.target.value })} /></label>
-        <label>轮询 URL<input value={providerDraft.poll_url || ''} onChange={(event) => setProviderDraft({ ...providerDraft, poll_url: event.target.value })} /></label>
-        <label>模型<input value={providerDraft.model || ''} onChange={(event) => setProviderDraft({ ...providerDraft, model: event.target.value })} /></label>
-        <label>API Key<input type="password" placeholder="已配置时留空" value={providerDraft.api_key || ''} onChange={(event) => setProviderDraft({ ...providerDraft, api_key: event.target.value })} /></label>
-        <label>超时（秒）<input type="number" min="1" value={providerDraft.timeout_seconds || 45} onChange={(event) => setProviderDraft({ ...providerDraft, timeout_seconds: Number(event.target.value) })} /></label>
-        <label className="span-2">Headers（JSON）<textarea value={headersText} onChange={(event) => updateJson(event.target.value, 'headers', setHeadersText)} /></label>
-        <label className="span-2">Body 模板（JSON）<textarea value={bodyText} onChange={(event) => updateJson(event.target.value, 'body_template', setBodyText)} /></label>
-        <label className="span-2">轮询与结果映射（JSONPath）<textarea value={mappingText} onChange={(event) => updateMapping(event.target.value)} /></label>
+  const activeProject = project;
+  const pageTitle = route === 'new' ? '新建项目' : route === 'projects' ? '项目' : route === 'settings' ? '设置' : route === 'advanced' ? '高级设置' : route === 'delivery' ? '成片预览' : activeProject?.name || 'OpenCine-AI';
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <button className="brand-button" onClick={() => navigate('projects')}><img src="/opencine-ai-logo.png" alt="OpenCine-AI" /><span><strong>OpenCine-AI</strong><small>AI 视频制作系统</small></span></button>
+      <nav aria-label="主导航">
+        <NavItem active={route === 'projects'} icon={<FolderOpen size={16} />} label="项目" onClick={() => navigate('projects')} />
+        <NavItem active={route === 'new'} icon={<Plus size={16} />} label="新建项目" onClick={() => navigate('new')} />
+        <NavItem active={['clarify', 'plan', 'progress', 'review', 'delivery'].includes(route)} icon={<Activity size={16} />} label="制作流程" onClick={() => navigate(route === 'projects' ? 'clarify' : route)} disabled={!activeProject} />
+        <NavItem active={route === 'settings'} icon={<Settings2 size={16} />} label="设置" onClick={() => navigate('settings')} />
+        <NavItem active={route === 'advanced'} icon={<ShieldCheck size={16} />} label="高级设置" onClick={() => navigate('advanced')} />
+      </nav>
+      <div className="sidebar-bottom"><span className="connection"><i />后端已连接</span><button className="nav-item" onClick={() => void apiFetch('/v1/auth/logout', { method: 'POST' }).finally(() => setAuth((value) => value ? { ...value, authenticated: false } : value))}><LogOut size={16} />退出登录</button></div>
+    </aside>
+    <main className="main">
+      <header className="topbar"><div><p className="kicker">{activeProject ? `项目 / ${activeProject.name}` : 'OpenCine-AI'}</p><h1>{pageTitle}</h1></div><div className="top-actions"><button className="icon-button" title={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'} aria-label={theme === 'light' ? '切换到暗色模式' : '切换到亮色模式'} onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}</button><button className="icon-button" title="刷新项目状态" aria-label="刷新项目状态" onClick={() => activeProject && void refreshProject(activeProject.id)}><RefreshCw size={18} /></button>{activeProject && <span className="status-chip"><i />{statusLabels[activeProject.status] || activeProject.status}</span>}</div></header>
+      {activeProject && <StageBar project={activeProject} route={route} onNavigate={navigate} onRewind={(target) => void rewind(target)} />}
+      {notice && <div className="notice"><Check size={16} />{notice}</div>}
+      {error && <div className="notice error"><CircleAlert size={16} /><span>{error}</span><button onClick={() => setError(null)} aria-label="关闭错误">关闭</button></div>}
+      <div className="page-content">
+        {route === 'projects' && <ProjectsPage projects={projectList} selected={activeProject?.id} onSelect={(id) => void selectProject(id)} onCreate={() => navigate('new')} />}
+        {route === 'new' && <NewProjectPage onCreate={(payload) => void createProject(payload)} running={running} defaults={settings?.settings} />}
+        {route === 'clarify' && activeProject && <ClarificationPage project={activeProject} onSubmit={(answers) => void answerClarifications(answers)} running={running} onBack={() => navigate('projects')} />}
+        {route === 'plan' && activeProject && <PlanPage project={activeProject} onGenerate={() => void makePlan()} onApprove={() => void approvePlan()} running={running} />}
+        {route === 'progress' && activeProject && <ProgressPage project={activeProject} events={events} onRun={() => void runProject()} onReview={() => navigate('review')} running={running} queued={queuedJobId !== null} />}
+        {route === 'review' && activeProject && <ReviewPage project={activeProject} onRetry={() => void refreshProject(activeProject.id)} onDelivery={() => navigate('delivery')} />}
+        {route === 'delivery' && activeProject && <DeliveryPage project={activeProject} onDeliver={() => void deliver()} onNewVersion={() => void createVersion()} running={running} />}
+        {route === 'settings' && <SettingsPage mode="basic" settings={settings} providers={providers} onReload={() => void loadSettings()} onSaved={(next) => setSettings(next)} />}
+        {route === 'advanced' && <SettingsPage mode="advanced" settings={settings} providers={providers} onReload={() => void loadSettings()} onSaved={(next) => setSettings(next)} />}
       </div>
-      <button className="primary" onClick={onSaveProvider} disabled={running || !providerDraft.id || !providerDraft.name}><Save size={15} />保存 Provider</button>
-    </section>}
-    <p className="settings-footnote">连接类配置：{settings?.requires_restart?.join('、') || '新任务立即读取普通设置'}</p>
-  </section>;
+    </main>
+  </div>;
 }
-function AuthPanel({ setup, form, setForm, onSubmit, error, running }: { setup: boolean; form: { username: string; password: string; confirm?: string }; setForm: (value: { username: string; password: string; confirm?: string }) => void; onSubmit: () => void; error: string | null; running: boolean }) { return <main className="auth-screen"><section className="auth-panel"><div className="brand auth-brand"><img className="brand-logo" src="/opencine-ai-logo.png" alt="OpenCine-AI" /><div><strong>OpenCine-AI</strong><span>AI 视频制作系统</span></div></div><p className="eyebrow">{setup ? '首次使用' : '管理员登录'}</p><h1>{setup ? '设置管理员账号' : '登录制作控制台'}</h1>{error && <div className="notice notice-error" role="alert"><CircleAlert size={16} />{error}</div>}<label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} /></label><label>密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} /></label>{setup && <label>确认密码<input type="password" value={form.confirm || ''} onChange={(event) => setForm({ ...form, confirm: event.target.value })} /></label>}<button className="primary wide" onClick={onSubmit} disabled={running || !form.username.trim() || form.password.length < 8}><KeyRound size={16} />{setup ? '完成初始化' : '登录'}</button></section></main>; }
-function NavButton({ active, icon, label, count, onClick }: { active: boolean; icon: ReactNode; label: string; count?: number; onClick: () => void }) { return <button className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={onClick}>{icon}{label}{count ? <b>{count}</b> : null}</button>; }
-function Metric({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail: string }) { return <div className="metric"><span className="metric-icon">{icon}</span><div><small>{label}</small><strong>{value}</strong><em>{detail}</em></div></div>; }
-function ProjectSettings({ project, setProject, resolved, onSave, running }: { project: Project; setProject: (value: Project) => void; resolved: Record<string, unknown>; onSave: () => void; running: boolean }) { const update = (key: keyof Brief, value: string | number | null) => setProject({ ...project, brief: { ...project.brief, [key]: value } }); return <section className="panel config-panel" id="project-settings"><div className="panel-head"><div><p className="eyebrow">项目配置</p><h2>生成参数</h2></div><button className="primary" onClick={onSave} disabled={running}><Save size={15} />保存参数</button></div><div className="config-grid"><label>视频总时长（秒）<input type="number" min="1" value={project.brief.duration_seconds} onChange={(event) => update('duration_seconds', Number(event.target.value))} /></label><label>单个镜头时长（秒）<input type="number" min="1" value={project.brief.shot_duration_seconds} onChange={(event) => update('shot_duration_seconds', Number(event.target.value))} /></label><label>并发模式<select value={project.brief.parallelism_mode} onChange={(event) => update('parallelism_mode', event.target.value)}><option value="auto">自动</option><option value="preset">预设</option><option value="custom">自定义</option></select></label><label>并发数量<input type="number" min="1" value={project.brief.parallelism || ''} onChange={(event) => update('parallelism', event.target.value ? Number(event.target.value) : null)} /></label><label>AI 验收标准<select value={project.brief.acceptance_mode} onChange={(event) => update('acceptance_mode', event.target.value)}><option value="auto">自动</option><option value="low">低严格</option><option value="standard">标准</option><option value="strict">严格</option><option value="custom">自定义</option><option value="none">无语义验收</option></select></label></div><div className="resolved-line">当前计划生效值：并发 {String(resolved.parallelism || '待解析')} · 验收 {acceptanceLabel(String(resolved.acceptance_mode || project.brief.acceptance_mode))}</div></section>; }
-function ClarificationPanel({ turns, answers, setAnswers, onSubmit, running }: { turns: ClarificationTurn[]; answers: Record<string, Answer>; setAnswers: (value: Record<string, Answer>) => void; onSubmit: () => void; running: boolean }) { return <section className="panel clarify-panel" id="clarification-gate"><div className="panel-head"><div><p className="eyebrow">需求澄清</p><h2>请补充缺失的创作信息</h2></div><span className="gate-count">{turns.length} 项待确认</span></div>{turns.map((turn) => { const current = answers[turn.id]; const text = typeof current === 'string' ? current : current?.answer || ''; return <div className="clarify-row" key={turn.id}><strong>{turn.question}</strong><div className="option-list">{(turn.options || []).map((option) => <label className="option" key={option.id}><input type="radio" name={turn.id} checked={text === option.value} onChange={() => setAnswers({ ...answers, [turn.id]: option.value })} /><span><b>{option.label}</b><small>{option.explanation}</small></span></label>)}</div><input value={text} placeholder="也可以填写自定义回答" onChange={(event) => setAnswers({ ...answers, [turn.id]: event.target.value })} /></div>; })}<button className="primary clarify-submit" onClick={onSubmit} disabled={running || turns.some((turn) => { const answer = answers[turn.id]; return !answer || (typeof answer === 'string' && !answer.trim()); })}><Check size={15} />确认答案</button></section>; }
-function ShotDetail({ active, latest, onRetry, running }: { active?: Shot; latest: Map<string, Attempt>; onRetry: () => void; running: boolean }) { if (!active) return <section className="panel detail-panel"><div className="empty-state">暂未选择镜头。</div></section>; const attempt = latest.get(active.id); return <section className="panel detail-panel"><div className="panel-head"><div><p className="eyebrow">镜头 {String(active.sequence).padStart(2, '0')} / 验收标准</p><h2>{active.title}</h2></div><span className="score">{verdictLabel(attempt?.judge_result?.verdict || 'PENDING')}</span></div><p className="description">{active.description}</p><div className="criteria">{active.acceptance_criteria.map((criterion) => { const result = attempt?.judge_result?.criterion_results.find((item) => item.criterion_id === criterion.id); const passed = result?.verdict === 'PASS'; return <div className="criterion" key={criterion.id}><span className={`criterion-icon ${passed ? 'passed' : ''}`}>{passed ? <Check size={13} /> : <CircleAlert size={13} />}</span><div><strong>{criterionLabel(criterion.category)}</strong><p>{criterion.statement}</p></div><span className="criterion-state">{verdictLabel(result?.verdict || 'PENDING')}</span></div>; })}</div><div className="prompt-block"><div className="prompt-head"><span>提示词包 v{active.prompt_bundle?.version || 1}</span><button onClick={onRetry} disabled={running}><RotateCcw size={14} />重试镜头</button></div><code>{active.prompt_bundle?.positive || '计划获批后将自动生成提示词。'}</code></div></section>; }
-function Event({ event }: { event: EventRecord }) { return <div className="event"><span className="event-icon"><Sparkles size={14} /></span><div><strong>{eventLabel(event.event_type)}</strong><p>{eventSummary(event)}</p></div><time>{formatTime(event.created_at)}</time></div>; }
-function eventLabel(type: string): string { return ({ 'project.created': '项目已创建', 'project.version.created': '新版本已创建', 'project.rewound': '项目已回退', 'plan.created': '计划已生成', 'plan.approved': '计划已审批', 'generation.started': '开始生成', 'project.delivered': '项目已交付' } as Record<string, string>)[type] || type; } function eventSummary(event: EventRecord): string { const payload = event.payload; if (payload.target_phase) return `回退到：${phaseName(String(payload.target_phase))}`; if (payload.error) return `错误：${String(payload.error)}`; return '项目状态已保存'; } function statusLabel(status?: string): string { return ({ clarifying: '等待需求澄清', awaiting_plan_approval: '等待计划审批', planned: '计划已就绪', generating: '正在生成', judging: '正在验收', repairing: '正在修复', awaiting_human: '等待人工审批', assembling: '正在组装', delivered: '已交付', failed: '失败', cancelled: '已取消' } as Record<string, string>)[status || ''] || '运行时离线'; } function verdictLabel(verdict: string): string { return ({ PASS: '通过', FAIL: '失败', QUEUED: '排队中', PENDING: '待验收' } as Record<string, string>)[verdict] || verdict; } function criterionLabel(category: string): string { return ({ subject: '主体', action: '动作', camera: '镜头', continuity: '连续性', style: '风格', technical: '技术', audio: '音频', safety: '安全' } as Record<string, string>)[category] || category; } function acceptanceLabel(value: string): string { return ({ auto: '自动', low: '低严格', standard: '标准', strict: '严格', custom: '自定义', none: '无语义验收' } as Record<string, string>)[value] || value; } function settingLabel(value: string): string { return ({ DIRECTOR_AUTH_ENABLED: 'WebUI 登录', DIRECTOR_HOST_CHECK_ENABLED: 'Host 限制', DIRECTOR_CORS_ENABLED: 'CORS 限制', DIRECTOR_RATE_LIMIT_ENABLED: '请求限流', DIRECTOR_CONTENT_SAFETY_ENABLED: '内容安全审核', DIRECTOR_PROVIDER_SAFETY_ENABLED: 'Provider 安全策略', DIRECTOR_DATABASE_URL: '数据库连接', REDIS_URL: 'Redis 连接', OBJECT_STORAGE_ENDPOINT: '对象存储连接', DIRECTOR_PROJECT_BUDGET_USD: '项目预算（美元）', DIRECTOR_DEFAULT_DURATION_SECONDS: '默认总时长（秒）', DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS: '默认镜头时长（秒）', DIRECTOR_DEFAULT_MAX_SHOTS: '默认最大镜头数', DIRECTOR_DEFAULT_ACCEPTANCE_MODE: '默认验收策略', DIRECTOR_PARALLELISM: '默认并发', VIDEO_PROVIDER: '视频 Provider', VIDEO_MODEL: '视频模型', DIRECTOR_LLM_MODEL: 'LLM 模型', DIRECTOR_VLM_MODEL: 'VLM 模型' } as Record<string, string>)[value] || value; } function phaseName(value: string): string { return ({ requirements: '需求', plan: '计划', generation: '生成', review: '验收', repair: '修复' } as Record<string, string>)[value] || value; } function formatTime(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); } function phaseFor(status?: string): number { if (status === 'clarifying') return 0; if (status === 'awaiting_plan_approval') return 1; if (status === 'planned' || status === 'generating') return 2; if (status === 'judging') return 3; if (status === 'repairing') return 4; return 5; } const phases = ['需求', '计划', '生成', '验收', '修复', '交付'];
+
+function AuthPage({ setup, form, setForm, onSubmit, error, running }: { setup: boolean; form: { username: string; password: string; confirm?: string }; setForm: (value: { username: string; password: string; confirm?: string }) => void; onSubmit: () => void; error: string | null; running: boolean }) {
+  return <main className="auth-screen"><section className="auth-panel"><div className="auth-brand"><img src="/opencine-ai-logo.png" alt="OpenCine-AI" /><div><strong>OpenCine-AI</strong><small>AI 视频制作系统</small></div></div><p className="kicker">{setup ? '首次使用' : '管理员登录'}</p><h1>{setup ? '设置管理员账号' : '登录制作空间'}</h1><p className="muted">{setup ? '先设置一个本地管理员账号，之后即可进入制作空间。' : '请输入管理员账号继续。'}</p>{error && <div className="notice error"><CircleAlert size={16} />{error}</div>}<label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} /></label><label>密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} /></label>{setup && <label>确认密码<input type="password" value={form.confirm || ''} onChange={(event) => setForm({ ...form, confirm: event.target.value })} /></label>}<button className="primary full" disabled={running || form.password.length < 8 || !form.username.trim()} onClick={onSubmit}><KeyRound size={16} />{setup ? '完成初始化' : '登录'}</button></section></main>;
+}
+
+function NavItem({ active, icon, label, onClick, disabled }: { active: boolean; icon: ReactNode; label: string; onClick: () => void; disabled?: boolean }) { return <button className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} disabled={disabled} onClick={onClick}>{icon}<span>{label}</span></button>; }
+
+function StageBar({ project, route, onNavigate, onRewind }: { project: Project; route: Route; onNavigate: (route: Route) => void; onRewind: (target: string) => void }) {
+  const current = phaseIndex(project.status); const active = phaseRoutes.indexOf(route);
+  return <div className="stage-bar">{phaseNames.map((name, index) => { const done = index < current; const selected = active === index || (route === 'projects' && index === 0); const target = phaseRoutes[index]; return <button key={name} className={`stage ${done ? 'done' : ''} ${selected ? 'selected' : ''}`} onClick={() => { if (index <= current) { if (index < current) onRewind(phaseKey(index)); else onNavigate(target); } }} disabled={index > current} aria-current={selected ? 'step' : undefined}><span>{done ? <Check size={13} /> : index + 1}</span><b>{name}</b>{index < phaseNames.length - 1 && <ArrowRight size={14} />}</button>; })}</div>;
+}
+
+function ProjectsPage({ projects, selected, onSelect, onCreate }: { projects: ProjectSummary[]; selected?: string; onSelect: (id: string) => void; onCreate: () => void }) {
+  return <section className="page-stack"><div className="page-intro"><div><p className="kicker">工作空间</p><h2>项目与交付版本</h2><p className="muted">每个项目都可以继续制作，也可以从已交付版本创建新的交付版本。</p></div><button className="primary" onClick={onCreate}><Plus size={16} />新建项目</button></div><section className="panel table-panel"><div className="panel-head table-head"><span>项目</span><span>状态</span><span>版本</span><span>更新时间</span><span>费用</span><span /></div>{projects.length ? projects.map((item) => <button className={`project-row ${selected === item.id ? 'selected' : ''}`} key={item.id} onClick={() => onSelect(item.id)}><span><strong>{item.name}</strong><small>{item.id}</small></span><span><StatusBadge status={item.status} /></span><span>v{item.version}</span><span>{formatDate(item.updated_at)}</span><span>${item.total_cost_usd.toFixed(2)}</span><ArrowRight size={16} /></button>) : <EmptyState title="还没有项目" detail="从一条创作提示词开始。" action="新建项目" onAction={onCreate} />}</section></section>;
+}
+
+function NewProjectPage({ onCreate, running, defaults }: { onCreate: (payload: Partial<Brief>) => void; running: boolean; defaults?: Record<string, string | number | boolean> }) {
+  const [form, setForm] = useState({ title: '', request: '', duration_seconds: Number(defaults?.DIRECTOR_DEFAULT_DURATION_SECONDS || 30), shot_duration_seconds: Number(defaults?.DIRECTOR_DEFAULT_SHOT_DURATION_SECONDS || 15), max_shots: Number(defaults?.DIRECTOR_DEFAULT_MAX_SHOTS || 2), budget_usd: Number(defaults?.DIRECTOR_PROJECT_BUDGET_USD || 75), fps: 24, aspect_ratio: '16:9', style: '', language: 'zh-CN', acceptance_mode: String(defaults?.DIRECTOR_DEFAULT_ACCEPTANCE_MODE || 'standard') });
+  const update = (key: string, value: string | number) => setForm((current) => ({ ...current, [key]: value }));
+  return <section className="page-stack narrow-page"><div className="page-intro"><div><p className="kicker">第一步</p><h2>先告诉导演你想做什么</h2><p className="muted">先输入原始创作提示词。系统会根据内容主动提出影响成片的问题。</p></div></div><section className="panel form-panel"><label className="wide-field">项目名称<input value={form.title} placeholder="例如：雨夜归信" onChange={(event) => update('title', event.target.value)} /></label><label className="wide-field">原始创作提示词<textarea autoFocus rows={8} value={form.request} placeholder="描述故事、人物、画面、节奏、声音或你已经确定的任何要求。" onChange={(event) => update('request', event.target.value)} /></label><div className="form-grid"><label>总时长（秒）<input type="number" min="1" value={form.duration_seconds} onChange={(event) => update('duration_seconds', Number(event.target.value))} /></label><label>单镜头时长（秒）<input type="number" min="1" value={form.shot_duration_seconds} onChange={(event) => update('shot_duration_seconds', Number(event.target.value))} /></label><label>最大镜头数<input type="number" min="1" value={form.max_shots} onChange={(event) => update('max_shots', Number(event.target.value))} /></label><label>预算（美元）<input type="number" min="0" value={form.budget_usd} onChange={(event) => update('budget_usd', Number(event.target.value))} /></label><label>帧率<select value={form.fps} onChange={(event) => update('fps', Number(event.target.value))}><option value="24">24 fps</option><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>画幅<select value={form.aspect_ratio} onChange={(event) => update('aspect_ratio', event.target.value)}><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option></select></label><label>语言<select value={form.language} onChange={(event) => update('language', event.target.value)}><option value="zh-CN">中文</option><option value="en-US">English</option></select></label><label>视觉风格<input value={form.style} placeholder="可留空，让澄清阶段继续判断" onChange={(event) => update('style', event.target.value)} /></label></div><div className="form-actions"><button className="primary" disabled={running || !form.request.trim()} onClick={() => onCreate({ ...form, title: form.title.trim() || '未命名项目', style: form.style.trim() || null, content_constraints: [], audio_required: true, parallelism_mode: 'auto', resolution_mode: 'auto' })}><ArrowRight size={16} />进入需求澄清</button></div></section></section>;
+}
+
+function ClarificationPage({ project, onSubmit, running, onBack }: { project: Project; onSubmit: (answers: Record<string, string | { answer?: string; skip?: boolean }>) => void; running: boolean; onBack: () => void }) {
+  const turns = project.clarification_turns.filter((turn) => !turn.confirmed);
+  const [answers, setAnswers] = useState<Record<string, string | { answer?: string; skip?: boolean }>>({});
+  return <section className="page-stack narrow-page"><div className="page-intro split"><div><p className="kicker">第二步</p><h2>需求澄清</h2><p className="muted">每轮最多展示 3 个高影响问题。回答后，LLM 会判断是否还需要继续澄清。</p></div><span className="progress-count">{turns.length} 项待确认</span></div>{turns.length === 0 ? <section className="panel success-panel"><Check size={24} /><div><h3>需求信息已经足够</h3><p className="muted">可以进入计划审核。</p></div><button className="primary" onClick={() => onSubmit({})}>查看计划 <ArrowRight size={16} /></button></section> : <section className="panel form-panel">{turns.slice(0, 3).map((turn) => { const current = answers[turn.id]; const text = typeof current === 'string' ? current : current?.answer || ''; return <div className="question" key={turn.id}><strong>{turn.question}</strong>{turn.options?.length ? <div className="option-list">{turn.options.map((option) => <label className={`option ${text === option.value ? 'chosen' : ''}`} key={option.id}><input type="radio" name={turn.id} checked={text === option.value} onChange={() => setAnswers({ ...answers, [turn.id]: option.value })} /><span><b>{option.label}</b><small>{option.explanation}</small></span></label>)}</div> : null}<input value={text} placeholder="也可以输入自己的回答" onChange={(event) => setAnswers({ ...answers, [turn.id]: event.target.value })} /></div>; })}<div className="form-actions"><button className="secondary" onClick={onBack}><ArrowLeft size={16} />返回项目</button><button className="primary" disabled={running || turns.slice(0, 3).some((turn) => { const value = answers[turn.id]; return !value || (typeof value === 'string' && !value.trim()); })} onClick={() => onSubmit(answers)}><Check size={16} />提交回答</button></div></section>}</section>;
+}
+
+function PlanPage({ project, onGenerate, onApprove, running }: { project: Project; onGenerate: () => void; onApprove: () => void; running: boolean }) {
+  const plan = activePlan(project);
+  return <section className="page-stack"><div className="page-intro split"><div><p className="kicker">第三步</p><h2>计划审核</h2><p className="muted">先看镜头顺序、提示词和验收标准，再开始制作。</p></div>{plan && <StatusBadge status={plan.status} />}</div>{!plan ? <EmptyState title="计划还没有生成" detail="需求澄清完成后，生成一版可审核计划。" action="生成计划" onAction={onGenerate} /> : <><section className="panel plan-summary"><div><span className="summary-label">镜头数量</span><strong>{plan.shots.length}</strong></div><div><span className="summary-label">总时长</span><strong>{project.brief.duration_seconds}s</strong></div><div><span className="summary-label">验收策略</span><strong>{acceptanceLabel(project.brief.acceptance_mode)}</strong></div><button className="primary" disabled={running || plan.status === 'approved'} onClick={onApprove}>{plan.status === 'approved' ? '计划已审核' : '审核并开始制作'} <ArrowRight size={16} /></button></section><section className="shot-cards">{plan.shots.map((shot) => <article className="shot-card" key={shot.id}><span className="shot-index">{String(shot.sequence).padStart(2, '0')}</span><div><h3>{shot.title}</h3><p>{shot.description}</p><span className="criteria-count">{shot.acceptance_criteria.length} 项验收标准</span></div><ArrowRight size={16} /></article>)}</section></>}</section>;
+}
+
+function ProgressPage({ project, events, onRun, onReview, running, queued }: { project: Project; events: EventRecord[]; onRun: () => void; onReview: () => void; running: boolean; queued: boolean }) {
+  const plan = activePlan(project); const latest = latestAttempts(project);
+  return <section className="page-stack"><div className="page-intro split"><div><p className="kicker">第四步</p><h2>制作进度</h2><p className="muted">生成、关键帧验收和组装会在这里持续更新。</p></div><button className="primary" onClick={project.status === 'awaiting_human' ? onReview : onRun} disabled={running || queued || ['generating', 'judging', 'repairing', 'assembling'].includes(project.status)}>{queued ? '制作已排队' : project.status === 'awaiting_human' ? '查看验收' : project.status === 'delivered' ? '查看成片' : '开始制作'}<Play size={15} /></button></div><section className="metrics"><Metric label="镜头" value={`${Object.keys(latest).length}/${plan?.shots.length || 0}`} /><Metric label="通过" value={`${Object.values(latest).filter((attempt) => attempt.judge_result?.verdict === 'PASS').length}`} /><Metric label="累计费用" value={`$${project.total_cost_usd.toFixed(2)}`} /><Metric label="当前状态" value={statusLabels[project.status] || project.status} /></section><div className="split-grid"><section className="panel"><div className="panel-head"><h3>镜头队列</h3><span>{plan?.shots.length || 0} 个镜头</span></div><div className="shot-list">{plan?.shots.map((shot) => { const attempt = latest[shot.id]; return <div className="shot-row" key={shot.id}><span className="shot-index">{String(shot.sequence).padStart(2, '0')}</span><span><strong>{shot.title}</strong><small>{attempt ? verdictLabel(attempt.judge_result?.verdict || attempt.status) : '尚未开始'}</small></span><StatusBadge status={attempt?.judge_result?.verdict || attempt?.status || 'queued'} /></div>; }) || <EmptyState title="等待计划" detail="审核计划后开始制作。" />}</div></section><section className="panel"><div className="panel-head"><h3>运行记录</h3><button className="text-button" onClick={onReview}>查看验收 <ArrowRight size={14} /></button></div><div className="event-list">{events.slice(-8).reverse().map((event) => <div className="event-row" key={event.id}><span className="event-dot" /><div><strong>{eventLabel(event.event_type)}</strong><small>{eventSummary(event)}</small></div><time>{formatTime(event.created_at)}</time></div>)}{!events.length && <EmptyState title="还没有运行记录" detail="开始制作后会显示状态变化。" />}</div></section></div></section>;
+}
+
+function ReviewPage({ project, onRetry, onDelivery }: { project: Project; onRetry: () => void; onDelivery: () => void }) {
+  const plan = activePlan(project); const latest = latestAttempts(project);
+  return <section className="page-stack"><div className="page-intro split"><div><p className="kicker">质量验收</p><h2>镜头与证据</h2><p className="muted">验收结果来自模型返回的证据。缺少证据时会保持失败，等待人工处理。</p></div>{project.status === 'awaiting_human' && <button className="primary" onClick={onDelivery}>进入成片预览 <ArrowRight size={16} /></button>}</div><section className="review-list">{plan?.shots.map((shot) => { const attempt = latest[shot.id]; return <article className="panel review-card" key={shot.id}><div className="review-head"><div><span className="shot-index">镜头 {String(shot.sequence).padStart(2, '0')}</span><h3>{shot.title}</h3></div><StatusBadge status={attempt?.judge_result?.verdict || 'PENDING'} /></div><p>{shot.description}</p><div className="criterion-list">{shot.acceptance_criteria.map((criterion) => { const result = attempt?.judge_result?.criterion_results.find((item) => item.criterion_id === criterion.id); return <div className="criterion-row" key={criterion.id}><span className={result?.verdict === 'PASS' ? 'pass' : 'pending'}>{result?.verdict === 'PASS' ? <Check size={14} /> : <CircleAlert size={14} />}</span><span>{criterion.statement}</span><small>{verdictLabel(result?.verdict || 'PENDING')}</small></div>; })}</div><button className="secondary" onClick={onRetry}><RotateCcw size={15} />刷新验收结果</button></article>; }) || <EmptyState title="还没有可验收的镜头" detail="开始制作后会显示验收详情。" />}</section></section>;
+}
+
+function DeliveryPage({ project, onDeliver, onNewVersion, running }: { project: Project; onDeliver: () => void; onNewVersion: () => void; running: boolean }) {
+  const delivery = activeDelivery(project); const mediaUrl = delivery ? `/v1/projects/${project.id}/artifacts/${delivery.id}/stream` : '';
+  return <section className="page-stack delivery-page"><div className="page-intro split"><div><p className="kicker">第五步</p><h2>成片预览</h2><p className="muted">在这里检查最终成片，确认后完成交付。</p></div>{project.status === 'delivered' ? <StatusBadge status="delivered" /> : <StatusBadge status={project.status} />}</div><section className="panel video-panel">{mediaUrl ? <video controls preload="metadata" src={mediaUrl}>你的浏览器不支持视频播放。</video> : <div className="media-empty"><Film size={30} /><strong>成片尚未生成</strong><span>完成制作和组装后，视频会出现在这里。</span></div>}<div className="video-meta"><div><span className="summary-label">项目</span><strong>{project.name}</strong></div><div><span className="summary-label">版本</span><strong>v{project.version || 1}</strong></div><div><span className="summary-label">总时长</span><strong>{project.brief.duration_seconds}s</strong></div></div></section><div className="form-actions delivery-actions">{delivery && <a className="primary" href={`/v1/projects/${project.id}/artifacts/${delivery.id}/download`}><Download size={16} />下载 MP4</a>}{project.status === 'awaiting_human' && delivery && <button className="primary" disabled={running} onClick={onDeliver}><Check size={16} />确认交付</button>}{project.status === 'delivered' && <button className="secondary" disabled={running} onClick={onNewVersion}><Plus size={16} />创建新版本</button>}<button className="secondary" onClick={() => window.open(mediaUrl, '_blank')} disabled={!mediaUrl}><ExternalLink size={15} />新窗口预览</button></div></section>;
+}
+
+function SettingsPage({ mode, settings, providers, onReload, onSaved }: { mode: 'basic' | 'advanced'; settings: SettingsResponse | null; providers: CustomProvider[]; onReload: () => void; onSaved: (settings: SettingsResponse) => void }) {
+  const [draft, setDraft] = useState<Record<string, string | number | boolean>>({}); const [providerDraft, setProviderDraft] = useState<CustomProvider | null>(null); const [providerJson, setProviderJson] = useState<ProviderJson>({ headers: '{}', body_template: '{}', poll: '{}', result: '{}' }); const [saving, setSaving] = useState(false); const [message, setMessage] = useState('');
+  useEffect(() => { if (settings) setDraft(settings.settings); }, [settings]);
+  const advancedKeys = ['DIRECTOR_AUTH_ENABLED', 'DIRECTOR_HOST_CHECK_ENABLED', 'DIRECTOR_CORS_ENABLED', 'DIRECTOR_RATE_LIMIT_ENABLED', 'DIRECTOR_CONTENT_SAFETY_ENABLED', 'DIRECTOR_PROVIDER_SAFETY_ENABLED', 'DIRECTOR_MAX_ATTEMPTS', 'DIRECTOR_DATABASE_URL', 'REDIS_URL', 'OBJECT_STORAGE_ENDPOINT'];
+  const keys = Object.keys(draft).filter((key) => mode === 'basic' ? !advancedKeys.includes(key) : advancedKeys.includes(key));
+  const save = async () => {
+    setSaving(true);
+    try {
+      const response = await apiFetch<SettingsResponse>(`/v1/settings/${mode}`, { method: 'PATCH', body: JSON.stringify(Object.fromEntries(keys.map((key) => [key, draft[key]]))) });
+      onSaved(response); setMessage('设置已保存。新任务会读取最新的普通设置。');
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : '设置保存失败'); }
+    finally { setSaving(false); }
+  };
+  const startProvider = (provider?: CustomProvider) => {
+    const value = provider ? { ...provider, api_key: '' } : { id: '', name: '', capability: 'video', method: 'POST', submit_url: '', api_key: '', model: '', timeout_seconds: 45 };
+    setProviderDraft(value);
+    setProviderJson({ headers: JSON.stringify(provider?.headers || {}, null, 2), body_template: JSON.stringify(provider?.body_template || {}, null, 2), poll: JSON.stringify(provider?.poll || {}, null, 2), result: JSON.stringify(provider?.result || {}, null, 2) });
+  };
+  const saveProvider = async () => {
+    if (!providerDraft) return;
+    setSaving(true);
+    try {
+      const payload = { ...providerDraft, headers: JSON.parse(providerJson.headers), body_template: JSON.parse(providerJson.body_template), poll: JSON.parse(providerJson.poll), result: JSON.parse(providerJson.result) };
+      const exists = providers.some((item) => item.id === providerDraft.id);
+      await apiFetch(`/v1/providers/custom${exists ? `/${providerDraft.id}` : ''}`, { method: exists ? 'PATCH' : 'POST', body: JSON.stringify(payload) });
+      setProviderDraft(null); onReload(); setMessage('Provider 已保存。');
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Provider 保存失败'); }
+    finally { setSaving(false); }
+  };
+  const removeProvider = async (id: string) => { if (!window.confirm('确认删除这个 Provider？')) return; await apiFetch(`/v1/providers/custom/${id}`, { method: 'DELETE' }); onReload(); };
+  return <section className="page-stack settings-page"><div className="page-intro split"><div><p className="kicker">{mode === 'basic' ? '工作参数' : '运行参数'}</p><h2>{mode === 'basic' ? '设置' : '高级设置'}</h2><p className="muted">{mode === 'basic' ? '配置模型、预算和默认制作参数。' : '配置数据库、认证、限流和安全策略。'}</p></div><button className="primary" disabled={saving} onClick={save}><Save size={16} />保存设置</button></div>{message && <div className="notice"><Check size={16} />{message}</div>}<section className="panel settings-panel"><div className="settings-grid">{keys.map((key) => <SettingField key={key} name={key} value={draft[key]} onChange={(value) => setDraft({ ...draft, [key]: value })} />)}</div>{settings?.requires_restart?.length && mode === 'advanced' ? <p className="settings-note">这些连接配置通常需要重启后端才会完全生效：{settings.requires_restart.join('、')}</p> : null}</section>{mode === 'basic' && <section className="panel provider-panel"><div className="panel-head"><div><h3>自定义 Provider</h3><p className="muted">用请求模板和 JSONPath 接入兼容接口，密钥只显示脱敏结果。</p></div><button className="secondary" onClick={() => startProvider()}><Plus size={15} />添加 Provider</button></div>{providerDraft && <ProviderEditor draft={providerDraft} setDraft={setProviderDraft} json={providerJson} setJson={setProviderJson} saving={saving} onSave={() => void saveProvider()} onCancel={() => setProviderDraft(null)} />}{providers.length ? providers.map((provider) => <div className="provider-row" key={provider.id}><span><strong>{provider.name}</strong><small>{provider.id} · {provider.capability} · {provider.api_key || '未配置密钥'}</small></span><div><button className="icon-button" title="编辑 Provider" onClick={() => startProvider(provider)}><Settings2 size={16} /></button><button className="icon-button danger-icon" title="删除 Provider" onClick={() => void removeProvider(provider.id)}><Trash2 size={16} /></button></div></div>) : <EmptyState title="还没有自定义 Provider" detail="需要接入其他视频或模型服务时，再添加即可。" />}</section>}</section>;
+}
+
+function SettingField({ name, value, onChange }: { name: string; value: string | number | boolean; onChange: (value: string | number | boolean) => void }) {
+  const isBool = typeof value === 'boolean'; const isNumber = typeof value === 'number';
+  return <label className={isBool ? 'toggle-field' : ''}>{isBool ? <><span>{settingLabels[name] || name}</span><input type="checkbox" checked={value} onChange={(event) => onChange(event.target.checked)} /></> : <>{settingLabels[name] || name}<input type={isNumber ? 'number' : name.includes('KEY') ? 'password' : 'text'} value={String(value ?? '')} placeholder={name.includes('KEY') ? '已配置时留空' : undefined} onChange={(event) => onChange(isNumber ? Number(event.target.value) : event.target.value)} /></>}</label>;
+}
+
+function ProviderEditor({ draft, setDraft, json, setJson, saving, onSave, onCancel }: { draft: CustomProvider; setDraft: (value: CustomProvider) => void; json: ProviderJson; setJson: (value: ProviderJson) => void; saving: boolean; onSave: () => void; onCancel: () => void }) {
+  const update = (key: keyof CustomProvider, value: string | number) => setDraft({ ...draft, [key]: value });
+  return <div className="provider-editor"><div className="form-grid"><label>ID<input value={draft.id} onChange={(event) => update('id', event.target.value)} /></label><label>名称<input value={draft.name} onChange={(event) => update('name', event.target.value)} /></label><label>能力<select value={draft.capability} onChange={(event) => update('capability', event.target.value)}><option value="video">视频</option><option value="llm">LLM</option><option value="vlm">VLM</option><option value="audio">音频</option><option value="reference">素材引用</option></select></label><label>请求方法<select value={draft.method || 'POST'} onChange={(event) => update('method', event.target.value)}><option>POST</option><option>GET</option><option>PUT</option></select></label><label className="span-2">提交 URL<input value={draft.submit_url || draft.base_url || ''} onChange={(event) => update('submit_url', event.target.value)} /></label><label>轮询 URL<input value={draft.poll_url || ''} onChange={(event) => update('poll_url', event.target.value)} /></label><label>模型<input value={draft.model || ''} onChange={(event) => update('model', event.target.value)} /></label><label>API Key<input type="password" value={draft.api_key || ''} placeholder="已配置时留空" onChange={(event) => update('api_key', event.target.value)} /></label><label>超时（秒）<input type="number" value={draft.timeout_seconds || 45} onChange={(event) => update('timeout_seconds', Number(event.target.value))} /></label><JsonField label="Headers JSON" value={json.headers} onChange={(value) => setJson({ ...json, headers: value })} /><JsonField label="Body 模板 JSON" value={json.body_template} onChange={(value) => setJson({ ...json, body_template: value })} /><JsonField label="轮询映射 JSON" value={json.poll} onChange={(value) => setJson({ ...json, poll: value })} /><JsonField label="结果 JSONPath" value={json.result} onChange={(value) => setJson({ ...json, result: value })} /></div><div className="form-actions"><button className="secondary" onClick={onCancel}>取消</button><button className="primary" disabled={saving || !draft.id || !draft.name || !(draft.submit_url || draft.base_url)} onClick={onSave}><Save size={15} />保存 Provider</button></div></div>;
+}
+function JsonField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) { return <label className="span-2">{label}<textarea rows={5} value={value} onChange={(event) => onChange(event.target.value)} /></label>; }
+function Metric({ label, value }: { label: string; value: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div>; }
+function StatusBadge({ status }: { status: string }) { const normalized = status.toLowerCase(); return <span className={`status-badge ${normalized.includes('pass') || normalized === 'delivered' ? 'pass' : normalized.includes('fail') ? 'fail' : ''}`}><i />{statusLabels[normalized] || verdictLabel(status)}</span>; }
+function EmptyState({ title, detail, action, onAction }: { title: string; detail: string; action?: string; onAction?: () => void }) { return <div className="empty-state"><FolderOpen size={22} /><strong>{title}</strong><span>{detail}</span>{action && onAction && <button className="secondary" onClick={onAction}>{action}</button>}</div>; }
+function activePlan(project: Project): Plan | undefined { return [...(project.plans || [])].reverse().find((plan) => plan.status !== 'obsolete'); }
+function activeDelivery(project: Project): Artifact | undefined { return [...(project.artifacts || [])].reverse().find((artifact) => artifact.kind === 'video' && artifact.metadata?.artifact_role === 'delivery' && artifact.metadata?.active === true); }
+function latestAttempts(project: Project): Record<string, Attempt> { return (project.attempts || []).reduce<Record<string, Attempt>>((result, attempt) => { if (!result[attempt.shot_id] || attempt.number > result[attempt.shot_id].number) result[attempt.shot_id] = attempt; return result; }, {}); }
+function routeForStatus(status: string): Route { if (status === 'clarifying') return 'clarify'; if (status === 'awaiting_plan_approval' || status === 'planned') return 'plan'; if (status === 'delivered') return 'delivery'; if (status === 'awaiting_human') return 'review'; return 'progress'; }
+function phaseIndex(status: string): number { if (status === 'clarifying') return 0; if (status === 'awaiting_plan_approval' || status === 'planned') return 1; if (['generating', 'judging', 'repairing'].includes(status)) return 2; if (status === 'awaiting_human' || status === 'assembling') return 3; if (status === 'delivered') return 4; return 0; }
+function phaseKey(index: number): string { return ['requirements', 'plan', 'generation', 'review', 'repair'][index] || 'requirements'; }
+function phaseName(value: string): string { return ({ requirements: '需求澄清', plan: '计划审核', generation: '制作进度', review: '质量验收', repair: '修复' } as Record<string, string>)[value] || value; }
+function verdictLabel(value: string): string { return ({ PASS: '通过', FAIL: '失败', PENDING: '待验收', queued: '排队中', submitted: '已提交', running: '制作中', generated: '已生成', judged_failed: '验收未通过' } as Record<string, string>)[value] || value; }
+function acceptanceLabel(value: string): string { return ({ auto: '自动', low: '低严格', standard: '标准', strict: '严格', custom: '自定义', none: '关闭语义验收' } as Record<string, string>)[value] || value; }
+function eventLabel(value: string): string { return ({ 'project.created': '项目已创建', 'project.version.created': '新版本已创建', 'project.rewound': '项目已回退', 'plan.created': '计划已生成', 'plan.approved': '计划已审核', 'generation.started': '开始制作', 'shot.generated': '镜头已生成', 'shot.judged': '镜头已验收', 'project.delivered': '项目已交付' } as Record<string, string>)[value] || value; }
+function eventSummary(event: EventRecord): string { if (event.payload.target_phase) return `回退到${phaseName(String(event.payload.target_phase))}`; if (event.payload.error) return String(event.payload.error); if (event.payload.verdict) return `结果：${verdictLabel(String(event.payload.verdict))}`; return '状态已保存'; }
+function formatDate(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('zh-CN'); }
+function formatTime(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); }

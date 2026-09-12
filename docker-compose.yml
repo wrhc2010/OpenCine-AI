@@ -1,93 +1,67 @@
 services:
-  api:
-    image: ${OPENCINE_API_IMAGE:-ghcr.io/wrhc2010/opencine-ai-api}:${OPENCINE_IMAGE_TAG:-v0.1.1}
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-director}
+      POSTGRES_USER: ${POSTGRES_USER:-director}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-director}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-director} -d ${POSTGRES_DB:-director}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    image: ${OPENCINE_BACKEND_IMAGE:-ghcr.io/wrhc2010/opencine-ai-backend}:${OPENCINE_IMAGE_TAG:-v0.1.1}
     build:
       context: .
       dockerfile: docker/api.Dockerfile
     environment:
-      DIRECTOR_DATABASE_URL: postgresql://director:director@postgres:5432/director
-      REDIS_URL: redis://redis:6379/0
-      OBJECT_STORAGE_ENDPOINT: http://minio:9000
-      OBJECT_STORAGE_BUCKET: video-director
-      DIRECTOR_PARALLELISM: ${DIRECTOR_PARALLELISM:-1}
+      DIRECTOR_DATABASE_URL: postgresql://${POSTGRES_USER:-director}:${POSTGRES_PASSWORD:-director}@database:5432/${POSTGRES_DB:-director}
+      # Four slashes are required for an absolute SQLite path in a URI.
+      DIRECTOR_QUEUE_URL: sqlite:////app/.data/director-queue.db
+      DIRECTOR_MEDIA_ROOT: /app/.data/media
       DIRECTOR_AUTH_ENABLED: ${DIRECTOR_AUTH_ENABLED:-true}
       DIRECTOR_HOST_CHECK_ENABLED: ${DIRECTOR_HOST_CHECK_ENABLED:-false}
       DIRECTOR_CORS_ENABLED: ${DIRECTOR_CORS_ENABLED:-false}
       DIRECTOR_RATE_LIMIT_ENABLED: ${DIRECTOR_RATE_LIMIT_ENABLED:-false}
       DIRECTOR_CONTENT_SAFETY_ENABLED: ${DIRECTOR_CONTENT_SAFETY_ENABLED:-false}
       DIRECTOR_PROVIDER_SAFETY_ENABLED: ${DIRECTOR_PROVIDER_SAFETY_ENABLED:-false}
+      DIRECTOR_PARALLELISM: ${DIRECTOR_PARALLELISM:-1}
+      DIRECTOR_MAX_ATTEMPTS: ${DIRECTOR_MAX_ATTEMPTS:-3}
+      VIDEO_PROVIDER: ${VIDEO_PROVIDER:-mock}
+      VIDEO_MODEL: ${VIDEO_MODEL:-video-model}
+      VIDEO_COST_PER_SECOND_USD: ${VIDEO_COST_PER_SECOND_USD:-0.25}
+      MOCK_VIDEO_COST_USD: ${MOCK_VIDEO_COST_USD:-1.25}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AGNES_API_KEY: ${AGNES_API_KEY:-}
+      AGNES_BACKUP_API_KEY: ${AGNES_BACKUP_API_KEY:-}
+      DIRECTOR_PROVIDER_INTERVAL_SECONDS: ${DIRECTOR_PROVIDER_INTERVAL_SECONDS:-60}
+      DIRECTOR_LLM_MODEL: ${DIRECTOR_LLM_MODEL:-gpt-4o-mini}
+      DIRECTOR_VLM_MODEL: ${DIRECTOR_VLM_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai-compatible-llm}
+      VLM_PROVIDER: ${VLM_PROVIDER:-openai-compatible-vlm-judge}
+      FAL_BASE_URL: ${FAL_BASE_URL:-}
+      FAL_API_KEY: ${FAL_API_KEY:-}
+      REPLICATE_BASE_URL: ${REPLICATE_BASE_URL:-}
+      REPLICATE_API_TOKEN: ${REPLICATE_API_TOKEN:-}
+      COMFYUI_BASE_URL: ${COMFYUI_BASE_URL:-http://host.docker.internal:8188}
+    volumes:
+      - backend-data:/app/.data
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
+      database:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
       interval: 10s
       timeout: 5s
-      retries: 10
-  worker:
-    image: ${OPENCINE_API_IMAGE:-ghcr.io/wrhc2010/opencine-ai-api}:${OPENCINE_IMAGE_TAG:-v0.1.1}
-    build:
-      context: .
-      dockerfile: docker/api.Dockerfile
-    command: ["python", "-m", "video_director.cli", "worker"]
-    environment:
-      DIRECTOR_DATABASE_URL: postgresql://director:director@postgres:5432/director
-      REDIS_URL: redis://redis:6379/0
-      OBJECT_STORAGE_ENDPOINT: http://minio:9000
-      OBJECT_STORAGE_BUCKET: video-director
-      DIRECTOR_PARALLELISM: ${DIRECTOR_PARALLELISM:-1}
-      DIRECTOR_AUTH_ENABLED: ${DIRECTOR_AUTH_ENABLED:-true}
-    depends_on:
-      api:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: director
-      POSTGRES_USER: director
-      POSTGRES_PASSWORD: director
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U director -d director"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-  redis:
-    image: redis:7-alpine
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: director
-      MINIO_ROOT_PASSWORD: director-secret
-    ports:
-      - "9001:9001"
-    volumes:
-      - minio-data:/data
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint: ["/bin/sh", "-c"]
-    command: >-
-      "until mc alias set local http://minio:9000 director director-secret; do sleep 2; done;
-      mc mb --ignore-existing local/video-director"
+      retries: 12
+
   web:
     image: ${OPENCINE_WEB_IMAGE:-ghcr.io/wrhc2010/opencine-ai-web}:${OPENCINE_IMAGE_TAG:-v0.1.1}
     build:
@@ -96,13 +70,14 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      api:
+      backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/healthz >/dev/null"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/healthz >/dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
+
 volumes:
   postgres-data:
-  minio-data:
+  backend-data:
