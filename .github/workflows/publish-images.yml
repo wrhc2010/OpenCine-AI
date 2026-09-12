@@ -26,7 +26,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - image: opencine-ai-api
+          - image: opencine-ai-backend
             dockerfile: docker/api.Dockerfile
           - image: opencine-ai-web
             dockerfile: docker/web.Dockerfile
